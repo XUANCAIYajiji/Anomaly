@@ -23,6 +23,8 @@
     "label.start_index": "起始索引",
     "label.z_offset": "高度偏移(厘米)",
     "label.empty_run": "食物：连续空点跳过阈值（区域）",
+    "label.food_filter": "只拾取勾选的单个食物",
+    "status.food_filter_empty": "未勾选任何物品：所有单个食物都会被跳过",
     "action.start": "开始自动拾取",
     "action.stop": "停止",
     "label.progress": "进度 {0}/{1}",

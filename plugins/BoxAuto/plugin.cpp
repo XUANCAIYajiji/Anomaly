@@ -283,6 +283,10 @@ struct Context final {
     // Panel setting: how many empty points in a row mark a region empty. Applies to both
     // kinds of food. Runtime state like the teleport offset, not persisted.
     std::atomic<std::uint32_t> food_empty_region_run{kFoodEmptyRegionRunDefault};
+    // 单个食物筛选：开启后只拾取勾选的物品，位图按 kFoodItems 下标。只作用于蓝图类命中
+    // kFoodItems 的箱子；其它类别（角色经验书、钱包、商店……）完全不受影响。
+    std::atomic_bool food_filter_enabled{};
+    std::atomic<std::uint32_t> food_filter_mask{};
     std::string food_empty_group;
     std::uint32_t food_empty_run{};
     std::chrono::steady_clock::time_point food_state_refresh_at{};
@@ -1571,6 +1575,49 @@ constexpr std::string_view ActorPrefixForCategory(
     if (category == "wallet") return "InteractBox";
     if (category == "shop_steal") return "ShopStealGoods_";
     return "";
+}
+
+// 单个食物箱子的物品表。蓝图类 `PropBox_Once_<字母>_Area01_001_C` 的字母决定掉落物：
+// 字母 -> 掉落 ID 取自静态表 DT_RandomItemDrop，掉落 ID -> 显示名由游戏内实测回填。
+// 「点位 -> 蓝图类」每次区域重新生成都会整体重新洗牌（实测：同一局、未重登，13 个点位上的
+// 类换了一整遍，但每个类对应的物品一个没变），所以判定物品只能读运行时箱子的实际类名，
+// 不能按点位名或坐标缓存。详细对照见 .local/item-drop-map.json。
+struct FoodItemInfo final {
+    char letter;
+    std::string_view drop_id;
+    std::string_view display_name;
+};
+
+constexpr std::array<FoodItemInfo, 13> kFoodItems{{
+    {'A', "Food_010", "劲爽「冰川」"},
+    {'B', "Food_011", "劲爽「谜」"},
+    {'C', "Food_009", "劲爽「果漾」"},
+    {'D', "Food_008", "炫动「零点」"},
+    {'E', "Food_015", "再来一口！「牛奶味」"},
+    {'F', "Food_016", "再来一口！「巧克力味」"},
+    {'G', "Food_014", "咕比奇黄油薯片"},
+    {'H', "Food_012", "咕比奇原味薯片"},
+    {'I', "Food_013", "咕比奇黄瓜薯片"},
+    {'J', "Food_023", "噗卡巧克力「经典系列」"},
+    {'K', "Food_024", "噗卡巧克力「果仁风暴」"},
+    {'L', "Food_025", "噗卡巧克力「热辣挑战」"},
+    {'M', "Food_026", "噗卡巧克力「绘莉巡演纪念款」"},
+}};
+
+// 命中返回 kFoodItems 下标；不是 13 个单食物类之一则返回 kFoodItems.size()。
+// 同前缀的其它类别（例如监狱资源 PropBox_Once_<其它字母>_…）会在这里落空，因此不受筛选影响。
+constexpr std::size_t FoodItemIndexForClass(const std::string_view class_name) noexcept {
+    constexpr std::string_view kClassPrefix = "PropBox_Once_";
+    if (class_name.size() <= kClassPrefix.size() + 1) return kFoodItems.size();
+    if (class_name.compare(0, kClassPrefix.size(), kClassPrefix) != 0) {
+        return kFoodItems.size();
+    }
+    if (class_name[kClassPrefix.size() + 1] != '_') return kFoodItems.size();
+    const char letter = class_name[kClassPrefix.size()];
+    for (std::size_t i = 0; i < kFoodItems.size(); ++i) {
+        if (kFoodItems[i].letter == letter) return i;
+    }
+    return kFoodItems.size();
 }
 
 // Caller must hold context.mutex.
@@ -3057,6 +3104,33 @@ void TickFoodPickup(Context& context, const Point& p,
             return;
         }
     }
+    // 单个食物筛选：读眼前箱子的实际蓝图类判定物品，没勾选就跳过这个点位。
+    // 类名读不到、或者不是 13 个单食物类之一时不拦截——同前缀的监狱资源等类别照常拾取。
+    if (context.target_actor != 0 &&
+        context.food_filter_enabled.load(std::memory_order_relaxed)) {
+        std::uintptr_t actor_class{};
+        if (Read(reinterpret_cast<const void*>(
+                     context.target_actor + kObjectClassOffset), actor_class) &&
+            actor_class != 0) {
+            const std::string class_name = ObjectName(context.names, actor_class);
+            const std::size_t item_index = FoodItemIndexForClass(class_name);
+            if (item_index < kFoodItems.size()) {
+                const std::uint32_t mask =
+                    context.food_filter_mask.load(std::memory_order_relaxed);
+                if ((mask & (std::uint32_t{1} << item_index)) == 0) {
+                    context.status =
+                        "未勾选，跳过 " +
+                        std::string(kFoodItems[item_index].display_name) + " [" +
+                        p.row_name + "]";
+                    ++context.skipped;
+                    ++context.current_index;
+                    ResetPointState(context);
+                    context.due = now;
+                    return;
+                }
+            }
+        }
+    }
     {
         double actor_pos[3]{};
         double player_pos[3]{};
@@ -4489,6 +4563,50 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
             "status.shop_requires_zankou", "商店偷取需要使用残虹");
         ui->text(ui->user, anomaly::sdk::StringView(requirement));
     }
+    // 单个食物筛选。勾选 = 要拾取：拾取前会按箱子的实际蓝图类判定物品，没勾选的直接跳过。
+    // 只影响 kFoodItems 里那 13 个单食物类，其它类别不经过这段判定。
+    if (ui->checkbox != nullptr) {
+        int filter_enabled =
+            context.food_filter_enabled.load(std::memory_order_relaxed) ? 1 : 0;
+        const std::string filter_label = context.localizer.Text(
+            "label.food_filter", "只拾取勾选的单个食物");
+        if (ui->checkbox(ui->user, anomaly::sdk::StringView(filter_label),
+                         &filter_enabled) != 0) {
+            context.food_filter_enabled.store(filter_enabled != 0,
+                                              std::memory_order_relaxed);
+        }
+        if (filter_enabled != 0) {
+            std::uint32_t mask =
+                context.food_filter_mask.load(std::memory_order_relaxed);
+            for (std::size_t i = 0; i < kFoodItems.size(); ++i) {
+                int checked = (mask & (std::uint32_t{1} << i)) != 0 ? 1 : 0;
+                const std::string item_label =
+                    std::string(kFoodItems[i].display_name) + "  " +
+                    std::string(kFoodItems[i].drop_id);
+                if (ui->checkbox(ui->user,
+                                 anomaly::sdk::StringView(item_label),
+                                 &checked) != 0) {
+                    if (checked != 0) {
+                        mask |= std::uint32_t{1} << i;
+                    } else {
+                        mask &= ~(std::uint32_t{1} << i);
+                    }
+                    context.food_filter_mask.store(mask,
+                                                   std::memory_order_relaxed);
+                }
+                if ((i + 1) % 2 != 0 && i + 1 < kFoodItems.size() &&
+                    ui->same_line != nullptr) {
+                    ui->same_line(ui->user, 0.0F, 4.0F);
+                }
+            }
+            if (mask == 0) {
+                const std::string empty_hint = context.localizer.Text(
+                    "status.food_filter_empty",
+                    "未勾选任何物品：所有单个食物都会被跳过");
+                ui->text(ui->user, anomaly::sdk::StringView(empty_hint));
+            }
+        }
+    }
     const bool developer_mode = context.developer_mode.load(std::memory_order_acquire);
     const std::string mode_label = context.localizer.Text(
         developer_mode ? "mode.teleport" : "mode.navigation",
@@ -4640,6 +4758,6 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         anomaly::sdk::StringView("anomaly.local.box-auto"),
         anomaly::sdk::StringView("Resource Auto Pickup"),
         anomaly::sdk::StringView("CCYellowStar"),
-        anomaly::sdk::StringView("0.1.15"), Load, Start, Stop, Unload, Update, Draw};
+        anomaly::sdk::StringView("0.2.0"), Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }
