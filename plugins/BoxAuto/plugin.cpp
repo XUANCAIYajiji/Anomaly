@@ -287,6 +287,17 @@ struct Context final {
     // kFoodItems 的箱子；其它类别（角色经验书、钱包、商店……）完全不受影响。
     std::atomic_bool food_filter_enabled{};
     std::atomic<std::uint32_t> food_filter_mask{};
+    // 点位耗时观测：记录「到这个点后等了多久才看到箱子 actor」。用来区分慢在「世界/actor
+    // 生成」还是慢在别处——排序优化只对前者有意义。每个点位开始时重置，actor 出现或放弃时
+    // 打一条日志。只读观测，不参与任何判定。
+    std::chrono::steady_clock::time_point point_started_at{};
+    bool point_timing_active{};
+    std::uint32_t point_load_polls{};
+    // 上一个点位的坐标：用来在耗时日志里带上「从上一个点跳到这里的距离」，
+    // 以便直接验证「跳得越近等得越少」这个前提。
+    double last_point_x{};
+    double last_point_y{};
+    bool has_last_point{};
     std::string food_empty_group;
     std::uint32_t food_empty_run{};
     std::chrono::steady_clock::time_point food_state_refresh_at{};
@@ -555,6 +566,9 @@ void ResetPointState(Context& context) noexcept {
     context.interact_verify_deadline = std::chrono::steady_clock::time_point{};
     context.shop_take_retries = 0;
     context.shop_rescan_cycles = 0;
+    context.point_started_at = std::chrono::steady_clock::time_point{};
+    context.point_timing_active = false;
+    context.point_load_polls = 0;
 }
 
 // Caller must hold context.mutex.
@@ -3069,8 +3083,44 @@ void TickPickup(Context& context, const Point& p,
     context.due = now + std::chrono::milliseconds(300);
 }
 
+// 点位耗时观测：从进入点位到看见箱子 actor（或放弃）实际等了多久。
+// 用来回答「慢在世界/actor 生成，还是慢在别处」——只有前者能靠调整点位顺序改善。
+// 只写日志，不参与判定；timing_active 保证一个点位只打一条。
+void LogPointTiming(Context& context, const Point& p,
+                    const std::chrono::steady_clock::time_point now,
+                    const char* outcome) {
+    if (!context.point_timing_active) return;
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - context.point_started_at).count();
+    context.point_timing_active = false;
+    const long long jump_cm = context.has_last_point
+        ? static_cast<long long>(std::sqrt(
+              PlanarDistanceSquared(context.last_point_x, context.last_point_y, p.x, p.y)))
+        : -1;
+    context.last_point_x = p.x;
+    context.last_point_y = p.y;
+    context.has_last_point = true;
+    std::string message = "point-timing ";
+    message += outcome;
+    message += " ms=";
+    message += std::to_string(elapsed_ms);
+    message += " polls=";
+    message += std::to_string(context.point_load_polls);
+    message += " jump_cm=";
+    message += std::to_string(jump_cm);
+    message += " point=";
+    message += p.row_name;
+    LogBox(context, message);
+}
+
 void TickFoodPickup(Context& context, const Point& p,
                     const std::chrono::steady_clock::time_point now) {
+    // 点位计时从这里开始：第一次进入该点时开始，之后同一轮重试不重置，直到 actor 出现或放弃。
+    if (!context.point_timing_active) {
+        context.point_started_at = now;
+        context.point_timing_active = true;
+        context.point_load_polls = 0;
+    }
     if (context.target_actor == 0) {
         context.target_actor =
             ScanForActor(context, p, ActorPrefixForCategory(p.category));
@@ -3078,6 +3128,7 @@ void TickFoodPickup(Context& context, const Point& p,
             context.target_actor = ScanForActor(context, p, "Prison");
         }
         if (context.target_actor == 0) {
+            ++context.point_load_polls;
             ++context.retry_count;
             if (context.retry_count <= kActorLoadWaitSeconds) {
                 context.due = now + std::chrono::milliseconds(1000);
@@ -3094,6 +3145,7 @@ void TickFoodPickup(Context& context, const Point& p,
                     ? "箱子未加载，重传 " + p.row_name
                     : "重传 " + p.row_name;
             } else {
+                LogPointTiming(context, p, now, "gave_up");
                 NoteFoodPointEmpty(context, p.row_name);
                 ++context.skipped;
                 ++context.current_index;
@@ -3103,6 +3155,7 @@ void TickFoodPickup(Context& context, const Point& p,
             }
             return;
         }
+        LogPointTiming(context, p, now, "found");
     }
     // 单个食物筛选：读眼前箱子的实际蓝图类判定物品，没勾选就跳过这个点位。
     // 类名读不到、或者不是 13 个单食物类之一时不拦截——同前缀的监狱资源等类别照常拾取。
