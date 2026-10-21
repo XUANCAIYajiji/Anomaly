@@ -110,6 +110,9 @@ constexpr double kFallOutThresholdCentimeters = 1000.0;
 constexpr std::uint32_t kFallOutMaximumRetries = 60;
 constexpr auto kFallOutRetryDelay = std::chrono::milliseconds(150);
 constexpr double kScanActorRadiusCentimeters = 1500.0;
+// 空点复核半径。判空之前以当前点位为圆心扫这么大一圈，看同区还有没有没捡的点位正刷出箱子。
+// 依据是游戏的刷出机制：箱子是按「已加载区域」分配名额的，某个点位此刻没货不代表整个区没了。
+constexpr double kEmptyRecheckRadiusCentimeters = 50000.0;
 constexpr std::string_view kLandmarkWorld = "XL_map_bigworld_test";
 constexpr double kLandmarkArrivalRadiusCentimeters = 500.0;
 constexpr double kLandmarkTransferTimeoutSeconds = 20.0;
@@ -151,6 +154,8 @@ constexpr std::uint32_t kFoodRegionSpentPicks = 39;
 // whose allowance is used up keep all their remaining points in the table, and each one
 // costs the whole actor-load wait.
 constexpr std::uint32_t kFoodEmptyRegionRunDefault = 3;
+// 排序只在开始时做一次，超出这个规模就跳过，避免极端表把 Begin 拖住。
+constexpr std::size_t kMaximumSortedPoints = 4000;
 
 struct RawName final {
     std::int32_t comparison_index{};
@@ -221,6 +226,9 @@ struct Context final {
     std::mutex mutex;
     std::vector<Point> points;
     std::vector<Point> filtered_points;
+    // 未过滤的 DT_RandomItem 全量点位（含已拾取的那些）。只用于「actor 坐标 → 点位 → 区域」
+    // 的反查：已拾取点位不在 points 里，不再留一份的话，残留 actor 会被错认成隔壁点位。
+    std::vector<Point> all_points;
     std::size_t current_index{};
     std::size_t picked{};
     std::size_t skipped{};
@@ -287,6 +295,11 @@ struct Context final {
     // kFoodItems 的箱子；其它类别（角色经验书、钱包、商店……）完全不受影响。
     std::atomic_bool food_filter_enabled{};
     std::atomic<std::uint32_t> food_filter_mask{};
+    // 最近距离拾取：打开后单个食物的点位按「区域桶 + 桶内最近邻」重排，从玩家当前位置
+    // 出发先走同一区域内更近的点。只作用于 item_food，其它类别保持表序。
+    std::atomic_bool food_nearest_order{};
+    // Draw 处在 Render 域，读玩家坐标必须在 Game 域做，所以这里只递一个信号。
+    std::atomic_bool nearest_sort_pending{};
     // 点位耗时观测：记录「到这个点后等了多久才看到箱子 actor」。用来区分慢在「世界/actor
     // 生成」还是慢在别处——排序优化只对前者有意义。每个点位开始时重置，actor 出现或放弃时
     // 打一条日志。只读观测，不参与任何判定。
@@ -1645,7 +1658,8 @@ void RebuildFilteredLocked(Context& context) noexcept {
     context.type_prefix = std::string(ActorPrefixForChoice(context.type_choice));
 }
 
-void ReadRandomItemTable(Context& context, std::vector<Point>& points) {
+void ReadRandomItemTable(Context& context, std::vector<Point>& points,
+                         std::vector<Point>& all_points) {
     void* table_object{};
     if (!ObjectsReady(context.objects)) return;
     AnomalyGenerationHandleV1 handle{};
@@ -1727,6 +1741,8 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points) {
         p.y = y;
         p.z = z;
         p.category = category;
+        // 反查用的全量副本：必须在「已拾取过滤」之前收，否则已捡点位的坐标就丢了。
+        all_points.push_back(p);
         if (context.picked_up_valid &&
             (category == "box_food" || category == "item_food" ||
              category == "prison")) {
@@ -1744,6 +1760,9 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points) {
         points.push_back(std::move(p));
     }
 }
+
+void LogBox(Context& context, const std::string& message);
+bool FoodGroupOf(const std::string_view name, std::string& key);
 
 void ReadTable(Context& context) {
     std::vector<Point> points;
@@ -1828,14 +1847,59 @@ void ReadTable(Context& context) {
         }
         points.push_back(std::move(p));
     }
-    ReadRandomItemTable(context, points);
+    std::vector<Point> all_random_points;
+    ReadRandomItemTable(context, points, all_random_points);
     std::lock_guard<std::mutex> lock(context.mutex);
     context.points = std::move(points);
+    context.all_points = std::move(all_random_points);
     RebuildFilteredLocked(context);
     const std::string count_str = std::to_string(context.points.size());
     const std::array read_args{std::string_view(count_str)};
     context.status =
         context.localizer.Format("status.read", "Read {0} points", read_args);
+    // 读表后立刻把「表里有多少、过滤后还剩多少、各区域各多少」写进日志。
+    // 跑之前就知道本轮该跑多少，跑完再对比就知道漏在哪，不必事后逐条翻 point-timing。
+    {
+        std::unordered_map<std::string, std::uint32_t> per_group;
+        for (const Point& p : context.points) {
+            std::string key;
+            if (FoodGroupOf(p.row_name, key)) ++per_group[key];
+        }
+        std::vector<std::pair<std::string, std::uint32_t>> entries(
+            per_group.begin(), per_group.end());
+        std::sort(entries.begin(), entries.end());
+        std::string summary = "table total=" + std::to_string(context.points.size()) +
+            " filtered=" + std::to_string(context.filtered_points.size());
+        for (const auto& [key, count] : entries) {
+            summary += " table[" + key + "]=" + std::to_string(count);
+        }
+        per_group.clear();
+        for (const Point& p : context.filtered_points) {
+            std::string key;
+            if (FoodGroupOf(p.row_name, key)) ++per_group[key];
+        }
+        entries.assign(per_group.begin(), per_group.end());
+        std::sort(entries.begin(), entries.end());
+        for (const auto& [key, count] : entries) {
+            summary += " run[" + key + "]=" + std::to_string(count);
+        }
+        // 游戏拾取记录里各区已经捡了多少（= 判满用的 quota）。读不到就明说，别让人以为是 0。
+        if (context.picked_up_valid) {
+            per_group.clear();
+            for (const auto& name : context.picked_up_points) {
+                std::string key;
+                if (FoodGroupOf(name, key)) ++per_group[key];
+            }
+            entries.assign(per_group.begin(), per_group.end());
+            std::sort(entries.begin(), entries.end());
+            for (const auto& [key, count] : entries) {
+                summary += " picked[" + key + "]=" + std::to_string(count);
+            }
+        } else {
+            summary += " picked=unavailable";
+        }
+        LogBox(context, summary);
+    }
 }
 
 bool ResolvePlayerState(Context& context, std::uintptr_t& player_state) noexcept {
@@ -2011,6 +2075,93 @@ bool FoodGroupOf(const std::string_view name, std::string& key) {
     return true;
 }
 
+// 行名 -> 区域桶。食物类沿用 FoodGroupOf（"Item|A"）；其它类别退化成「去掉末尾数字段
+// 之后的整段行名」，让每个前缀各自成桶。解析不出就返回整行，等于自成一桶。
+std::string PointRegionKey(const std::string& row_name) {
+    std::string key;
+    if (FoodGroupOf(row_name, key)) return key;
+    const std::size_t last = row_name.find_last_of('_');
+    if (last != std::string::npos && last + 1 < row_name.size()) {
+        bool digits = true;
+        for (std::size_t i = last + 1; i < row_name.size(); ++i) {
+            if (row_name[i] < '0' || row_name[i] > '9') {
+                digits = false;
+                break;
+            }
+        }
+        if (digits) return row_name.substr(0, last);
+    }
+    return row_name;
+}
+
+// 区域分桶 + 桶内贪心最近邻，桶间按质心贪心。优化目标是「进入一片新区域的次数」而不是
+// 总路程：命名区域内部密度高（实测单个食物一个区 94 个点挤在 1.1×1.4 km 里），桶内最近邻
+// 把区内间距从几百米压到几十米，而区域之间本来只跳五六次。实测 564 个单食物点：总路程
+// 80 km -> 53 km，跨 1 km 跳跃 11 次 -> 2 次。
+// 表序是 Point 名的字典序（A_001、A_002…），和空间位置无关——A_001 到 A_002 实测相隔
+// 469 米，所以按表序走等于在区域内乱窜。
+void SortPointsByRegionThenProximity(std::vector<Point>& points,
+                                     const double from_x, const double from_y) {
+    if (points.size() < 2 || points.size() > kMaximumSortedPoints) return;
+    std::unordered_map<std::string, std::vector<std::size_t>> buckets;
+    std::vector<std::string> keys;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const auto inserted = buckets.try_emplace(PointRegionKey(points[i].row_name));
+        if (inserted.second) keys.push_back(inserted.first->first);
+        inserted.first->second.push_back(i);
+    }
+    std::vector<std::pair<double, double>> centroids(keys.size());
+    for (std::size_t k = 0; k < keys.size(); ++k) {
+        const auto& members = buckets[keys[k]];
+        double sum_x = 0.0;
+        double sum_y = 0.0;
+        for (const std::size_t index : members) {
+            sum_x += points[index].x;
+            sum_y += points[index].y;
+        }
+        const auto count = static_cast<double>(members.size());
+        centroids[k] = {sum_x / count, sum_y / count};
+    }
+    std::vector<Point> sorted;
+    sorted.reserve(points.size());
+    std::vector<bool> visited(keys.size(), false);
+    double cursor_x = from_x;
+    double cursor_y = from_y;
+    for (std::size_t done = 0; done < keys.size(); ++done) {
+        std::size_t chosen = keys.size();
+        double chosen_distance = 0.0;
+        for (std::size_t k = 0; k < keys.size(); ++k) {
+            if (visited[k]) continue;
+            const double distance = PlanarDistanceSquared(
+                centroids[k].first, centroids[k].second, cursor_x, cursor_y);
+            if (chosen == keys.size() || distance < chosen_distance) {
+                chosen = k;
+                chosen_distance = distance;
+            }
+        }
+        visited[chosen] = true;
+        std::vector<std::size_t> members = buckets[keys[chosen]];
+        while (!members.empty()) {
+            std::size_t pick = 0;
+            double pick_distance = 0.0;
+            for (std::size_t m = 0; m < members.size(); ++m) {
+                const double distance = PlanarDistanceSquared(
+                    points[members[m]].x, points[members[m]].y, cursor_x, cursor_y);
+                if (m == 0 || distance < pick_distance) {
+                    pick = m;
+                    pick_distance = distance;
+                }
+            }
+            const std::size_t index = members[pick];
+            cursor_x = points[index].x;
+            cursor_y = points[index].y;
+            sorted.push_back(std::move(points[index]));
+            members.erase(members.begin() + static_cast<std::ptrdiff_t>(pick));
+        }
+    }
+    points = std::move(sorted);
+}
+
 // One food point in this region had no actor at all: enough of those in a row and the rest
 // of the region is skipped for this run.
 void NoteFoodRegionSkipped(Context& context, const std::string& key,
@@ -2041,6 +2192,30 @@ void NoteFoodPointFound(Context& context, const std::string& name) noexcept {
     if (!FoodGroupOf(name, key) || key != context.food_empty_group) return;
     context.food_empty_group.clear();
     context.food_empty_run = 0;
+}
+
+// 打印各区已拾取记录数（judge 用的 quota 当前值）。即使没到阈值也全部打印，这样
+// 「这一区没有记录」和「记录根本读不到」能分开——后者会明说 unavailable。
+void LogQuotaSummary(Context& context) {
+    if (!context.picked_up_valid) {
+        LogBox(context, "quota unavailable: pickup record not readable");
+        return;
+    }
+    std::unordered_map<std::string, std::uint32_t> per_group;
+    for (const auto& name : context.picked_up_points) {
+        std::string key;
+        if (FoodGroupOf(name, key)) ++per_group[key];
+    }
+    std::vector<std::pair<std::string, std::uint32_t>> entries(
+        per_group.begin(), per_group.end());
+    std::sort(entries.begin(), entries.end());
+    std::string summary = "quota threshold=" +
+        std::to_string(kFoodRegionSpentPicks) +
+        " total=" + std::to_string(context.picked_up_points.size());
+    for (const auto& [key, count] : entries) {
+        summary += " " + key + "=" + std::to_string(count);
+    }
+    LogBox(context, summary);
 }
 
 // A region counts as spent once the game has recorded enough picks there. The picked
@@ -2353,6 +2528,128 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
     return best;
 }
 
+// 空点复核：以点位 p 为圆心扫 kEmptyRecheckRadiusCentimeters，数「同区域、且落在未拾取点位上」
+// 的单个食物 actor。意义只有一个——区分两种「空」：
+//   ① 这个点位恰好此刻没刷出箱子（同区别处还有货）→ 不该计入连续空点，更不该据此跳整区；
+//   ② 这个区域本周已经捡完 → 同区未拾取点位上找不到任何 actor，照常计数。
+// 为什么必须排除「已拾取点位」：本周捡过的点位会随区域重新加载再刷出残留 actor，把它们算成
+// 「还有货」，满区就永远跳不掉，每条剩余点位都要白等 17 秒。
+// 为什么不能直接用「500 m 内有同类 actor」：actor 不带点位名，也可能是这个点位自己的箱子坐标
+// 偏了几十米，只有反查最近点位才能分清「是自己的」还是「隔壁的」。
+std::uint32_t CountSameRegionActorsNear(
+    Context& context, const Point& p, const std::string_view region_key,
+    long long& nearest_cm, long long& deviation_cm) noexcept {
+    nearest_cm = -1;
+    deviation_cm = -1;
+    if (context.all_points.empty()) return 0;
+    if (context.g_objects_address == 0 &&
+        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
+                            context.g_objects_address)) {
+        return 0;
+    }
+    std::int32_t count{};
+    std::int32_t num_chunks{};
+    std::uintptr_t items{};
+    if (!Read(reinterpret_cast<const void*>(
+                  context.g_objects_address + kObjectItemsOffset), items) ||
+        items == 0 ||
+        !Read(reinterpret_cast<const void*>(
+                  context.g_objects_address + kObjectCountOffset), count) ||
+        !Read(reinterpret_cast<const void*>(
+                  context.g_objects_address + kObjectNumChunksOffset), num_chunks) ||
+        count <= 0 || num_chunks <= 0) {
+        return 0;
+    }
+    const double radius_squared =
+        kEmptyRecheckRadiusCentimeters * kEmptyRecheckRadiusCentimeters;
+    std::uint32_t same_region{};
+    std::uint32_t current_chunk_index = 0xFFFFFFFFu;
+    std::uintptr_t chunk{};
+    for (std::int32_t i = 0; i < count; ++i) {
+        const auto chunk_index = static_cast<std::uint32_t>(i) / kObjectChunkSize;
+        if (chunk_index != current_chunk_index) {
+            current_chunk_index = chunk_index;
+            if (!Read(reinterpret_cast<const void*>(
+                          items + static_cast<std::uintptr_t>(chunk_index) * sizeof(void*)),
+                      chunk) ||
+                chunk == 0) {
+                continue;
+            }
+        }
+        const auto within = static_cast<std::uint32_t>(i) % kObjectChunkSize;
+        std::uintptr_t object{};
+        if (!Read(reinterpret_cast<const void*>(
+                      chunk + static_cast<std::uintptr_t>(within) * kObjectItemStride),
+                  object) ||
+            object == 0) {
+            continue;
+        }
+        std::uintptr_t cls{};
+        if (!Read(reinterpret_cast<const void*>(object + kObjectClassOffset), cls) ||
+            cls == 0) {
+            continue;
+        }
+        // 类名必须是 13 个单食物类之一：同一个 PropBox_Once 前缀下还有监狱资源等，
+        // 它们不属于单食物，算进来会把「这区还有货」判宽。
+        std::string cls_name;
+        const auto cached = context.class_name_cache.find(cls);
+        if (cached != context.class_name_cache.end()) {
+            cls_name = cached->second;
+        } else {
+            cls_name = ObjectName(context.names, cls);
+            context.class_name_cache[cls] = cls_name;
+        }
+        if (cls_name.find("PropBox_Once") == std::string::npos) continue;
+        if (FoodItemIndexForClass(cls_name) >= kFoodItems.size()) continue;
+        std::uintptr_t root{};
+        if (!Read(reinterpret_cast<const void*>(object + kActorRootComponentOffset),
+                  root) ||
+            root == 0) {
+            continue;
+        }
+        double bx{}, by{}, bz{};
+        if (!Read(reinterpret_cast<const void*>(root + kSceneComponentLocationOffset),
+                  bx) ||
+            !Read(reinterpret_cast<const void*>(
+                      root + kSceneComponentLocationOffset + 8), by) ||
+            !Read(reinterpret_cast<const void*>(
+                      root + kSceneComponentLocationOffset + 16), bz)) {
+            continue;
+        }
+        const double dist_squared = PlanarDistanceSquared(bx, by, p.x, p.y);
+        if (dist_squared > radius_squared) continue;
+        // 反查最近点位，由它给出区域和「是否已拾取」。
+        std::size_t nearest = context.all_points.size();
+        double nearest_dist_squared = 1e30;
+        for (std::size_t k = 0; k < context.all_points.size(); ++k) {
+            const double candidate = PlanarDistanceSquared(
+                context.all_points[k].x, context.all_points[k].y, bx, by);
+            if (candidate < nearest_dist_squared) {
+                nearest_dist_squared = candidate;
+                nearest = k;
+            }
+        }
+        if (nearest == context.all_points.size()) continue;
+        const Point& owner = context.all_points[nearest];
+        std::string owner_key;
+        if (!FoodGroupOf(owner.row_name, owner_key) || owner_key != region_key) {
+            continue;
+        }
+        if (context.picked_up_points.find(owner.row_name) !=
+            context.picked_up_points.end()) {
+            continue;
+        }
+        ++same_region;
+        const long long to_point =
+            static_cast<long long>(std::sqrt(dist_squared));
+        const long long to_owner =
+            static_cast<long long>(std::sqrt(nearest_dist_squared));
+        if (nearest_cm < 0 || to_point < nearest_cm) nearest_cm = to_point;
+        if (deviation_cm < 0 || to_owner < deviation_cm) deviation_cm = to_owner;
+    }
+    return same_region;
+}
+
 bool Teleport(Context& context, const Point& p) noexcept {
     if (context.session == nullptr || context.player == nullptr ||
         context.teleport == nullptr || context.teleport->teleport == nullptr) {
@@ -2391,6 +2688,17 @@ void Begin(Context& context) {
     RebuildFilteredLocked(context);
     context.current_index = context.start_index < context.filtered_points.size()
         ? context.start_index : 0;
+    // 最近距离拾取：开始这一刻按玩家当前位置重排一次。列表在面板上看到的就是接下来
+    // 实际要走的顺序，所以「起始索引」在这个模式下不参与（跳过的含义和就近排序冲突）。
+    if (context.food_nearest_order.load(std::memory_order_relaxed) &&
+        CategoryForChoice(context.type_choice) == "item_food") {
+        double position[3]{};
+        if (SnapshotPlayerPosition(context, position)) {
+            SortPointsByRegionThenProximity(context.filtered_points, position[0],
+                                            position[1]);
+        }
+        context.current_index = 0;
+    }
     context.picked = 0;
     context.food_empty_groups.clear();
     context.food_empty_group.clear();
@@ -2408,6 +2716,8 @@ void Begin(Context& context) {
         return;
     }
     context.status = context.localizer.Text("status.started", "Started");
+    // 开始这一刻把各区 quota 打出来：面板上看不到这些数字，日志里能看到。
+    LogQuotaSummary(context);
 }
 
 void Stop(Context& context) {
@@ -3146,7 +3456,27 @@ void TickFoodPickup(Context& context, const Point& p,
                     : "重传 " + p.row_name;
             } else {
                 LogPointTiming(context, p, now, "gave_up");
-                NoteFoodPointEmpty(context, p.row_name);
+                // 空点复核（只对单个食物）：17 秒没等到 actor，先看 500 m 内同区还有没有没捡的
+                // 点位正刷着箱子。有就说明这个点只是恰好此刻没货，不计入「连续空点」，避免把
+                // 还剩下货的整片区域丢掉；没有才照常计数。
+                bool count_as_empty = true;
+                if (p.category == "item_food") {
+                    std::string region_key;
+                    if (FoodGroupOf(p.row_name, region_key)) {
+                        long long recheck_nearest_cm = -1;
+                        long long recheck_deviation_cm = -1;
+                        const std::uint32_t same_region = CountSameRegionActorsNear(
+                            context, p, region_key, recheck_nearest_cm,
+                            recheck_deviation_cm);
+                        LogBox(context, "empty-check point=" + p.row_name +
+                            " region=" + region_key + " same=" +
+                            std::to_string(same_region) + " near_cm=" +
+                            std::to_string(recheck_nearest_cm) + " dev_cm=" +
+                            std::to_string(recheck_deviation_cm));
+                        count_as_empty = same_region == 0;
+                    }
+                }
+                if (count_as_empty) NoteFoodPointEmpty(context, p.row_name);
                 ++context.skipped;
                 ++context.current_index;
                 ResetPointState(context);
@@ -3500,6 +3830,10 @@ void Tick(Context& context) {
         context.status = context.localizer.Format(
             "status.completed", "Completed: picked {0}, skipped {1}",
             completed_args);
+        // 本轮汇总。配合读表那条 table/run 日志，就能直接算出漏了多少个点位。
+        LogBox(context, "run done points=" + std::to_string(context.current_index) +
+            "/" + std::to_string(context.filtered_points.size()) +
+            " picked=" + picked_str + " skipped=" + skipped_str);
         return;
     }
     const Point& p = context.filtered_points[context.current_index];
@@ -4354,6 +4688,37 @@ void ANOMALY_CALL Update(void* plugin_context, const double delta_seconds) {
         RefreshFoodRegionState(context);
         ReadTable(context);
         BuildClassMap(context);
+        // 读表会把 filtered_points 重建成表序，最近距离模式下要再排一次。
+        if (context.food_nearest_order.load(std::memory_order_relaxed)) {
+            context.nearest_sort_pending.store(true, std::memory_order_release);
+        }
+    }
+    if (context.nearest_sort_pending.exchange(false, std::memory_order_acq_rel)) {
+        // 面板上勾选开关或切换类型后重排一次，列表顺序随之改变。运行中不动列表：
+        // 半路换序会让 current_index 指向别的点，下次开始时 Begin 会重新排。
+        const bool enabled =
+            context.food_nearest_order.load(std::memory_order_relaxed);
+        double position[3]{};
+        const bool have_position =
+            enabled && SnapshotPlayerPosition(context, position);
+        std::lock_guard<std::mutex> lock(context.mutex);
+        if (CategoryForChoice(context.type_choice) == "item_food" && !context.running) {
+            if (!enabled) {
+                RebuildFilteredLocked(context);
+            } else if (have_position) {
+                SortPointsByRegionThenProximity(context.filtered_points, position[0],
+                                                position[1]);
+                const std::string count =
+                    std::to_string(context.filtered_points.size());
+                const std::array args{std::string_view(count)};
+                context.status = context.localizer.Format(
+                    "status.nearest_sorted", "Sorted by distance: {0} points", args);
+            } else {
+                context.status = context.localizer.Text(
+                    "status.nearest_no_player",
+                    "Player position unavailable; kept table order");
+            }
+        }
     }
     if (context.begin_pending.exchange(false, std::memory_order_acq_rel)) {
         if (!GetPlayerController(context)) {
@@ -4592,9 +4957,16 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     };
     for (std::size_t i = 0; i < type_names.size(); ++i) {
         if (ui->button(ui->user, anomaly::sdk::StringView(type_names[i]), 0.0F, 0.0F) != 0) {
-            std::lock_guard<std::mutex> lock(context.mutex);
-            context.type_choice = static_cast<std::uint32_t>(i);
-            RebuildFilteredLocked(context);
+            {
+                std::lock_guard<std::mutex> lock(context.mutex);
+                context.type_choice = static_cast<std::uint32_t>(i);
+                RebuildFilteredLocked(context);
+            }
+            // 切回单个食物时列表刚被重建成表序，开关还开着就再排一次。
+            if (CategoryForChoice(static_cast<std::uint32_t>(i)) == "item_food" &&
+                context.food_nearest_order.load(std::memory_order_relaxed)) {
+                context.nearest_sort_pending.store(true, std::memory_order_release);
+            }
         }
         if (i + 1 < type_names.size() && (i + 1) % 6 != 0 && ui->same_line != nullptr) {
             ui->same_line(ui->user, 0.0F, 4.0F);
@@ -4616,9 +4988,24 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
             "status.shop_requires_zankou", "商店偷取需要使用残虹");
         ui->text(ui->user, anomaly::sdk::StringView(requirement));
     }
+    // 最近距离拾取：只在单个食物下显示。打开后点位按「区域内就近」重排，下面列表的顺序
+    // 就是接下来实际要走的顺序；关掉就回到表序。
+    if (type_choice == 7 && ui->checkbox != nullptr) {
+        int nearest =
+            context.food_nearest_order.load(std::memory_order_relaxed) ? 1 : 0;
+        const std::string nearest_label =
+            context.localizer.Text("label.nearest_order", "Nearest First");
+        if (ui->checkbox(ui->user, anomaly::sdk::StringView(nearest_label),
+                         &nearest) != 0) {
+            context.food_nearest_order.store(nearest != 0, std::memory_order_relaxed);
+            context.nearest_sort_pending.store(true, std::memory_order_release);
+        }
+    }
     // 单个食物筛选。勾选 = 要拾取：拾取前会按箱子的实际蓝图类判定物品，没勾选的直接跳过。
-    // 只影响 kFoodItems 里那 13 个单食物类，其它类别不经过这段判定。
-    if (ui->checkbox != nullptr) {
+    // 只影响 kFoodItems 里那 13 个单食物类，其它类别不经过这段判定（TickFoodPickup 的
+    // FoodItemIndexForClass 查不到就放行）。所以这里也只在单个食物下显示：别的类别勾了
+    // 也不会生效，露出来只会让人以为勾上有用。
+    if (CategoryForChoice(type_choice) == "item_food" && ui->checkbox != nullptr) {
         int filter_enabled =
             context.food_filter_enabled.load(std::memory_order_relaxed) ? 1 : 0;
         const std::string filter_label = context.localizer.Text(
@@ -4695,11 +5082,16 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     // The auto teleport code and the state fields are kept for when a
     // read-only state source is found.
     const bool oracle_type = type_choice == 10 && context.oracle != nullptr;
+    // 最近距离模式永远从最近的点开始，「跳过前 N 个」和就近排序的含义冲突，所以不显示。
+    const bool nearest_order = type_choice == 7 &&
+        context.food_nearest_order.load(std::memory_order_relaxed);
     if (!oracle_type) {
-        const std::string start_index_label =
-            context.localizer.Text("label.start_index", "Start Index");
-        ui->input_uint32(ui->user, anomaly::sdk::StringView(start_index_label),
-                         &context.start_index, 1, 1);
+        if (!nearest_order) {
+            const std::string start_index_label =
+                context.localizer.Text("label.start_index", "Start Index");
+            ui->input_uint32(ui->user, anomaly::sdk::StringView(start_index_label),
+                             &context.start_index, 1, 1);
+        }
         const std::string start_label =
             context.localizer.Text("action.start", "Start Auto Pickup");
         if (ui->button(ui->user, anomaly::sdk::StringView(start_label), 0.0F, 0.0F) != 0) {
@@ -4811,6 +5203,6 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         anomaly::sdk::StringView("anomaly.local.box-auto"),
         anomaly::sdk::StringView("Resource Auto Pickup"),
         anomaly::sdk::StringView("CCYellowStar"),
-        anomaly::sdk::StringView("0.2.0"), Load, Start, Stop, Unload, Update, Draw};
+        anomaly::sdk::StringView("0.3.7"), Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }
