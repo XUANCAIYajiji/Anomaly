@@ -8,6 +8,12 @@
 
 qq交流群: 1037114140
 
+<a href="https://discord.gg/tfeh8QQ9Vy"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Anomaly Discord" /></a>
+
+<p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
+
 <p align="center">
   <a href="docs/user-guide/README.md">用户文档</a> ·
   <a href="docs/user-guide/third-party-plugins.md">第三方插件</a> ·
@@ -51,36 +57,51 @@ qq交流群: 1037114140
 - 🚀 **安装与更新**：解压 Runtime，打开启动器，选中 `HTGame.exe` 所在目录即可安装；后续版本也能直接更新。
 - 🪟 **游戏内管理界面**：按 `Insert` 呼出中文或英文界面，统一管理插件的启用、停用、重载和设置。
 - 🌐 **第三方插件下载**：在 **Plugins > 可用** 中浏览和安装社区插件，在 **更新** 中升级，也可以自行添加可信插件源。
-- 🔌 **实用内建插件**：随包提供坐标显示、实体 ESP、粉爪大劫案 ESP、自定义 UID、相机工具与反虚化、骨骼动作调整、资源点自动拾取、打怪资源点、自动副本与 WalletCollector，全部默认关闭，按需启用。
+- 🔌 **实用内建插件**：随包提供坐标显示、实体 ESP、粉爪大劫案 ESP 与银行循环、载具控制、999夜自动刷怪、战斗伤害仪表盘、自定义 UID、相机工具与反虚化、骨骼动作调整、资源点自动拾取、打怪资源点、自动副本与 WalletCollector，全部默认关闭，按需启用。
 - 🎥 **相机工具**：Camera Tools 将视距与视角 FOV 修改、自由相机整合到同一套相机 Hook 中，避免两个相机插件同时启用时发生 Hook 冲突。
-- 🤖 **自动化任务**：Resource Auto Pickup、Combat Resource Points、Clone Enter 与 WalletCollector 支持按传送或寻路自动执行，并可在插件窗口中随时停止。
+- 🤖 **自动化任务**：Resource Auto Pickup、Combat Resource Points、Clone Enter、WalletCollector 与 999夜脚本支持自动传送、战斗或拾取，并可在插件窗口中随时停止。
 - 🧭 **状态与排错**：插件不兼容、依赖缺失或 Profile 未就绪时会直接显示原因，详细状态可在 **Diagnostics** 和日志中查看。
 - 🧩 **开放插件框架**：提供纯 C ABI v1 SDK 和统一 V1 服务，插件工程无需依赖 Runtime 源码或 C++ ABI。
 - 🔄 **完整插件生命周期**：支持 Manifest、SemVer、依赖与 capability 校验、包校验、文件监控热重载和失败回滚。
-- 🧬 **UE5 / NTE 适配**：提供经过校验的 UE5 符号解析，以及会话、玩家、相机、实体、地图地标和传送等高层服务；条件不满足时按功能降级。
+- 🧬 **UE5 / NTE 适配**：提供经过校验的 UE5 符号解析，以及会话、玩家、相机、实体、地图地标、传送和载具等高层服务；条件不满足时按功能降级。
 - 🔍 **内存分析与开发工具**：支持查看进程模块、PE 节区和内存区域，并提供字节签名扫描、离线 TestHost 等开发工具。
 - 🛡️ **故障隔离**：单个插件异常后会被隔离；新版本加载失败时自动回滚到上一代。
 
 ### 🔌 内建插件
 
-运行包默认安装以下插件（详见[内建插件](docs/user-guide/built-in-plugins.md)）：
+运行包包含以下常用内建插件（完整说明见[内建插件](docs/user-guide/built-in-plugins.md)）：
 
 | 插件 | 作用 |
 | --- | --- |
 | **Coordinate Display** | 显示玩家坐标、会话状态与采样指标 |
 | **Entity ESP** | 绘制实体边界框与标签 |
-| **Pink Paw Heist ESP** | 显示粉爪大劫案的战利品与撤离点，可按价值筛选 |
+| **Deserted** | 阻止人流和车流生成，不影响站桩 NPC |
+| **Pink Paw Heist ESP** | 显示粉爪大劫案的战利品与撤离点，支持价值筛选、银行循环拾取、次数限制及入场动画跳过 |
+| **NTE Vehicle（开发者模式）** | 查看、召唤和调校当前载具，支持载具目录、显示名称、速度、扭矩、车轮摩擦及非玩家载具控制 |
+| **999夜脚本** | 在999夜赤龙古堡按指定次数循环刷怪：营地刷新、双战斗点自动战斗 |
+| **NTE Damage Dashboard** | 实时统计玩家角色伤害、命中、暴击、队伍与技能分布及最近命中记录 |
+| **Summon Lab（召唤实验室）** | 按蓝图批量召唤，最多管理 256 个实体，预设等级和出生属性，支持敌对/宠物模式、按蓝图分组对战与批量管理、分页查看与清理 |
 | **Custom UID** | 自定义客户端界面上显示的 UID |
+| **换肤器 Lite** | 提供角色配饰、滑翔翼、觉醒外观预览与自定义车牌 |
 | **Camera Tools** | 增加视距、调整视角 FOV 和自由相机视角，并可选按自由相机位置加载场景 |
-| **CameraBlurFix** | 取消抬头时角色身上的虚化效果 |
-| **Better Pose** | 调整角色动作速率、暂停与位移缩放，编辑关节姿态，并可导入 MMD 动作与镜头 |
+| **CameraBlurFix** | 取消角色与 NPC/人群实体的镜头虚化效果 |
+| **Better Pose** | 调整角色动作速率、暂停与位移缩放，编辑关节姿态，并可导入 MMD 动作与镜头，支持播放速度、高度修正、XYZ 移动比例、分部位幅度、逐关节校准、四肢伸展/落点和手动 A/T 形骨骼校准，以及 Blender 骨架联动 |
+| **HiFi Vehicle Music** | 使用本地无损曲库替换车载音乐，支持 WASAPI、DirectSound 与 ASIO |
 | **Quick Ultimate** | 按住 Alt+1/2/3/4，自动切换角色并持续发送 Q，松开后停止 |
 | **Resource Auto Pickup** | 读取资源点表，按传送或寻路自动拾取角色经验书、家具、食物、钱包等资源点 |
 | **Combat Resource Points** | 逐个前往打怪宝箱与异像家具材料点自动战斗，完成后标记并本地缓存 |
 | **Clone Enter** | 按副本与难度自动进本、战斗、领奖并退出，支持循环执行 |
+| **AutoFish** | 自动抛竿、提竿与遛鱼，支持连续钓鱼、鱼饵补购及按阈值卖鱼 |
+| **AutoTaxi（自动出租车）** | 自动接客、送达及结算后继续接单，显示游戏确认的新增订单数 |
+| **AutoClaw（自动抓娃娃）** | 选择当前机器内的娃娃，手动投币确认后自动抓取，并显示游戏结算结果 |
 | **Free Fly** | 自由飞行与穿墙：WASD 移动、空格上升、Ctrl 下降，方向跟随视角，开关快捷键可自定义 |
 | **WalletCollector** | 扫描钱包刷新点，按目标数量规划路线并自动拾取 |
+| **Model Scale** | 缩放本地角色网格，不影响移动或碰撞 |
+| **UI Buttons** | 列出可点击的游戏 UI 按钮，并可通过界面服务执行点击 |
 | **Jelly** | 让镜头内的人物、载具与动态模型持续挤压拉伸，可调强度、频率、停止间隔与自转 |
+
+开发者模式还会显示 **Teleport**、**DLL Loader**、**Time Accel** 与 **Memory Dump** 等调试插件；完整包目录见
+[`plugins/README.md`](plugins/README.md)。
 
 ### 🌐 第三方插件
 
@@ -115,7 +136,7 @@ qq交流群: 1037114140
 .\build.cmd
 ```
 
-`build.cmd` 是唯一受支持构建路径（CMake Preset `windows-vs2022` + `windows-relwithdebinfo`）的薄包装器，配置 → 构建后生成可直接部署的运行包。默认只构建 Runtime、Tools 与 SDK，开发夹具、诊断探针和 PDB 用 `build.cmd fixtures|probes|symbols` 按需开启。详见[从源码构建](docs/developer-guide/building.md)。
+`build.cmd` 是唯一受支持构建路径（CMake Preset `windows-vs2022` + `windows-relwithdebinfo`）的薄包装器，配置 → 构建后生成可直接部署的运行包。默认只构建 Runtime、Tools 与 SDK，开发夹具和 PDB 用 `build.cmd fixtures|symbols` 按需开启。详见[从源码构建](docs/developer-guide/building.md)。
 
 ## 📚 文档
 

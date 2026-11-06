@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 2,
+  "id": "anomaly.nte-vehicle",
+  "name": "Vehicle Control",
+  "description": "Vehicle control: plain vehicle summoning, per-model customized summoning, performance tuning, wheel friction, full durability for the current land vehicle, and diagnostics.",
+  "author": "Anomaly",
+  "license": "AGPL-3.0-only",
+  "audience": "developer",
+  "version": "0.10.6",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "nte"
+  ],
+  "builds": [
+    "nte-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "anomaly.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.input",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.window",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.nte.vehicle",
+      "minVersion": 8
+    },
+    {
+      "id": "anomaly.nte.player",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.plugin-state",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.localization",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "ui-window",
+    "input",
+    "nte-vehicle",
+    "nte-player-snapshot",
+    "configuration"
+  ]
+}

@@ -1,6 +1,7 @@
 #include "anomaly/ue5_process_event.hpp"
 #include "anomaly/ue5_object_lookup.hpp"
 #include "anomaly/ue5_ftext.hpp"
+#include "anomaly/ue5_assets.hpp"
 
 #include <Windows.h>
 
@@ -159,6 +160,7 @@ FeatureLayoutValidatorRegistry Ue5FeatureLayoutValidators() {
     FeatureLayoutValidatorRegistry validators;
     RegisterUe5ObjectLookupValidator(validators);
     RegisterUe5FTextValidator(validators);
+    RegisterUe5AssetsValidator(validators);
     validators.Register(std::string(kUe5ProcessEventAbiValidator), ValidateProcessEventAbi);
     validators.Register(
         std::string(kUe5ActorProcessEventAbiValidator),
@@ -184,7 +186,7 @@ Ue5ProcessEventInvoker CreateUe5ProcessEventInvoker(
                const std::uintptr_t function,
                void* const parameters,
                const std::size_t parameter_size) {
-        if (object == 0 || function == 0 || parameter_size > 4096U ||
+        if (object == 0 || function == 0 ||
             (parameter_size != 0 && parameters == nullptr)) {
             return false;
         }

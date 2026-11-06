@@ -5,7 +5,7 @@
 #include "anomaly/sdk/services/ui.h"
 #include "anomaly/sdk/services/nte.h"
 #include "anomaly/sdk/services/localization.h"
-#include "plugins/common/localization.hpp"
+#include "anomaly/sdk/localization.hpp"
 #include "oracle_stone_profile.hpp"
 #include "oracle_stone_runtime.hpp"
 
@@ -28,6 +28,8 @@
 #include <vector>
 
 namespace {
+using box_auto_compat::native_layout;
+using box_auto_compat::compatibility;
 
 constexpr std::string_view kEnvTablePath =
     "/Game/DataTable/Treasurebox/DT_EnvirTreasureBoxConfig.DT_EnvirTreasureBoxConfig";
@@ -39,56 +41,69 @@ constexpr std::string_view kBigWorldYaHaHaTablePath =
 constexpr std::string_view kRandomItemDropTablePath =
     "/Game/DataAssets/DataAssetSet/RandomItem/DT_RandomItemDrop.DT_RandomItemDrop";
 
-constexpr std::ptrdiff_t kDataTableRowMapOffset = 0x30;
-constexpr std::uint32_t kDataTableRowStride = 24;
-constexpr std::uint32_t kDataTableRowPointerOffset = 8;
-constexpr std::ptrdiff_t kCoordOffset = 48;
-constexpr std::ptrdiff_t kRandomItemCoordOffset = 80;
-constexpr std::ptrdiff_t kRandomItemTypeOffset = 32;
+// World safes come from the map's own point table: a safe actor only exists while its level cell is
+// loaded, so the table is what covers the whole map. The row keeps its location at a different
+// offset than the other two tables, and the actor class is BP_WorldSafeBox_lV1_C / _lV2_C.
+constexpr std::string_view kSafeTablePath =
+    "/Game/DataAssets/DataAssetSet/RandomItem/DT_PointTreasureBox.DT_PointTreasureBox";
+constexpr std::string_view kSafeRowPrefix = "HTTargetPoint_Safe_Box";
+constexpr std::string_view kSafeActorPrefix = "WorldSafeBox";
+// The client event chain that opens a world safe; the first event that flips
+// BP_IsTreasureBoxOpened ends it.
+constexpr std::string_view kSafeUnlockSteps[] = {"BP_ClientUnlockTreasureBox",
+                                                 "BP_OpenTreasureBox",
+                                                 "NetMulticast_NotifyTreasureBoxUnlock"};
 
-constexpr std::string_view kGObjectsPattern =
-    "48 8B 05 ?? ?? ?? ?? 48 8B 0C C8 48 8B 04 D1 C3 33 C0 48 8B 00 C3";
-constexpr std::string_view kGWorldPattern =
-    "48 8B 1D ?? ?? ?? ?? 48 85 DB 74 ?? 41 B0 01";
-constexpr std::string_view kGetRecordOwnerPattern =
-    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 "
-    "48 8B 99 60 01 00 00 48 8B E9";
-constexpr std::ptrdiff_t kGObjectsAddend = -16;
+// Lost locker keys (BP_CabinetKey_*) are interactable actors rather than table rows, so their
+// points come from a GObjects sweep instead of a table.
+constexpr std::string_view kKeyClassNeedle = "CabinetKey";
+
+
+
+
+
+
+
+
+constexpr std::string_view kGObjectsPattern = "kGObjectsPattern";
+constexpr std::string_view kGWorldPattern = "kGWorldPattern";
+constexpr std::string_view kGetRecordOwnerPattern = "kGetRecordOwnerPattern";
+
 constexpr std::uint32_t kRipDisplacementOffset = 3;
 constexpr std::uint32_t kRipInstructionSize = 7;
-constexpr std::ptrdiff_t kObjectItemsOffset = 16;
-constexpr std::ptrdiff_t kObjectCountOffset = 36;
-constexpr std::ptrdiff_t kObjectNumChunksOffset = 44;
-constexpr std::uint32_t kObjectChunkSize = 65536;
-constexpr std::uint32_t kObjectItemStride = 24;
 
-constexpr std::ptrdiff_t kObjectClassOffset = 16;
-constexpr std::ptrdiff_t kObjectNameOffset = 24;
-constexpr std::ptrdiff_t kUStructChildrenOffset = 72;
-constexpr std::ptrdiff_t kUStructSuperStructOffset = 64;
-constexpr std::ptrdiff_t kUFieldNextOffset = 40;
-constexpr std::ptrdiff_t kUClassDefaultObjectOffset = 272;
-constexpr std::ptrdiff_t kUFunctionNumParmsOffset = 180;
-constexpr std::ptrdiff_t kUFunctionParmsSizeOffset = 182;
-constexpr std::ptrdiff_t kUFunctionFlagsOffset = 176;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 constexpr std::uint32_t kFuncNativeFlag = 0x400;
-constexpr std::ptrdiff_t kWorldGameInstanceOffset = 560;
-constexpr std::ptrdiff_t kGameInstanceLocalPlayersOffset = 56;
-constexpr std::ptrdiff_t kLocalPlayerControllerOffset = 48;
-constexpr std::ptrdiff_t kControllerPlayerStateOffset = 720;
-constexpr std::ptrdiff_t kRecordOwnerFindRecordVtableOffset = 280;
-constexpr std::ptrdiff_t kRecordOwnerOffset = 8;
-constexpr std::ptrdiff_t kRecordIndexOffset = 16;
-constexpr std::ptrdiff_t kRecordDescriptorTableOffset = 24;
-constexpr std::uint32_t kRecordDescriptorStride = 40;
-constexpr std::ptrdiff_t kRecordDescriptorStoreOffset = 32;
-constexpr std::ptrdiff_t kRecordStoreRowsOffset = 32;
-constexpr std::ptrdiff_t kRecordGetStringVtableOffset = 224;
+
+
+
+
+
+
+
+
+
+
+
+
 constexpr std::uint32_t kMaximumRecordRows = 10000;
-constexpr std::size_t kProcessEventVtableIndex = 0x4C;
-constexpr std::ptrdiff_t kActorRootComponentOffset = 456;
-constexpr std::ptrdiff_t kSceneComponentLocationOffset = 280;
-constexpr std::ptrdiff_t kInteractFinishOffset = 976;
+
+
+
+
 constexpr std::int32_t kScanBatchSize = 8192;
 constexpr std::size_t kMaximumNameBytes = 1024;
 
@@ -194,6 +209,7 @@ void OracleQueueTeleport(Context& context, const double position[3]);
 }  // namespace oracle_stone_impl
 
 struct Context final {
+    const AnomalyCoreServiceV1* core{};
     const AnomalyHostApiV1* host{};
     const AnomalySignatureServiceV1* signature{};
     const AnomalyUe5NamesServiceV1* names{};
@@ -205,7 +221,7 @@ struct Context final {
     const AnomalyNteNavigationServiceV1* navigation{};
     const AnomalyNteMapLandmarksServiceV1* map_landmarks{};
     const AnomalyNtePickupServiceV1* pickup{};
-    anomaly::plugins::Localizer localizer;
+    anomaly::sdk::Localizer localizer;
     std::uintptr_t g_objects_address{};
     std::uintptr_t g_world_address{};
     std::uintptr_t controller{};
@@ -236,6 +252,15 @@ struct Context final {
     bool teleported{};
     bool moving{};
     bool interacted{};
+    // Safe flow: the unlock chain was dispatched, and the points confirmed as opened so that
+    // every later table read drops them.
+    bool safe_dispatched{};
+    int safe_grace{};
+    std::unordered_set<std::string> safe_opened_points;
+    // Locker key flow: the interact request went out, and the grace ticks spent waiting for the
+    // actor to disappear.
+    bool key_fired{};
+    int key_grace{};
     bool food_approaching{};
     std::chrono::steady_clock::time_point food_approach_deadline{};
     std::chrono::steady_clock::time_point interact_verify_deadline{};
@@ -402,7 +427,8 @@ bool UsesPickupService(const std::string_view category) noexcept {
 
 bool IsRelaxedPrefix(const std::string_view prefix) noexcept {
     return prefix == "PropBox_Yahaha" || prefix == "PropBox_Once" ||
-        prefix == "Prison" || prefix == "InteractBox" || prefix == "ShopStealGoods_";
+        prefix == "Prison" || prefix == "InteractBox" || prefix == "ShopStealGoods_" ||
+        prefix == kSafeActorPrefix || prefix == kKeyClassNeedle;
 }
 
 bool DeveloperModeEnabled(const AnomalyUiServiceV1* ui) noexcept {
@@ -560,6 +586,10 @@ void ResetPointState(Context& context) noexcept {
     context.teleported = false;
     context.moving = false;
     context.interacted = false;
+    context.safe_dispatched = false;
+    context.safe_grace = 0;
+    context.key_fired = false;
+    context.key_grace = 0;
     context.food_approaching = false;
     context.food_has_last_pos = false;
     context.fallout_baseline_z = 0.0;
@@ -715,15 +745,8 @@ bool ResolveFunction(Context& context, const std::string_view pattern,
                      std::uintptr_t& address) noexcept {
     address = 0;
     if (!SignatureReady(context.signature)) return false;
-    std::uintptr_t instruction{};
-    if (context.signature->resolve(context.signature->user,
-                                   anomaly::sdk::StringView("HTGame.exe"),
-                                   anomaly::sdk::StringView(".text"),
-                                   anomaly::sdk::StringView(pattern), &instruction)
-            .code != ANOMALY_STATUS_V1_OK ||
-        instruction == 0) {
-        return false;
-    }
+    const auto instruction = compatibility.Address(pattern);
+    if (instruction == 0) return false;
     address = instruction;
     return true;
 }
@@ -733,15 +756,8 @@ bool ResolveRipRelative(
     const std::ptrdiff_t addend, std::uintptr_t& address) noexcept {
     address = 0;
     if (!SignatureReady(context.signature)) return false;
-    std::uintptr_t instruction{};
-    if (context.signature->resolve(
-            context.signature->user, anomaly::sdk::StringView("HTGame.exe"),
-            anomaly::sdk::StringView(".text"),
-            anomaly::sdk::StringView(pattern), &instruction)
-            .code != ANOMALY_STATUS_V1_OK ||
-        instruction == 0) {
-        return false;
-    }
+    const auto instruction = compatibility.Address(pattern);
+    if (instruction == 0) return false;
     std::int32_t displacement{};
     if (!Read(reinterpret_cast<const void*>(instruction + kRipDisplacementOffset),
               displacement)) {
@@ -765,22 +781,22 @@ void* ObjectAt(const std::uintptr_t g_objects, const std::uint32_t index) noexce
     std::int32_t count{};
     std::int32_t num_chunks{};
     std::uintptr_t items{};
-    if (!Read(reinterpret_cast<const void*>(g_objects + kObjectItemsOffset), items) ||
+    if (!Read(reinterpret_cast<const void*>(g_objects + native_layout.kObjectItemsOffset), items) ||
         items == 0 ||
-        !Read(reinterpret_cast<const void*>(g_objects + kObjectCountOffset), count) ||
-        !Read(reinterpret_cast<const void*>(g_objects + kObjectNumChunksOffset),
+        !Read(reinterpret_cast<const void*>(g_objects + native_layout.kObjectCountOffset), count) ||
+        !Read(reinterpret_cast<const void*>(g_objects + native_layout.kObjectNumChunksOffset),
               num_chunks) ||
         count <= 0 || index >= static_cast<std::uint32_t>(count) || num_chunks <= 0) {
         return nullptr;
     }
-    const auto chunk_index = index / kObjectChunkSize;
-    const auto within = index % kObjectChunkSize;
+    const auto chunk_index = index / native_layout.kObjectChunkSize;
+    const auto within = index % native_layout.kObjectChunkSize;
     if (chunk_index >= static_cast<std::uint32_t>(num_chunks)) return nullptr;
     const auto chunk = ReadPointer(reinterpret_cast<const void*>(
         items + static_cast<std::uintptr_t>(chunk_index) * sizeof(void*)));
     if (!chunk) return nullptr;
     return ReadPointer(reinterpret_cast<const std::uint8_t*>(chunk) +
-        static_cast<std::uintptr_t>(within) * kObjectItemStride);
+        static_cast<std::uintptr_t>(within) * native_layout.kObjectItemStride);
 }
 
 std::string ResolveName(
@@ -808,34 +824,7 @@ using oracle_stone_locator_profile::kGObjectsPattern;
 using oracle_stone_locator_profile::kGWorldPattern;
 using oracle_stone_locator_profile::kRipDisplacementOffset;
 using oracle_stone_locator_profile::kRipInstructionSize;
-using oracle_stone_locator_profile::kGObjectsAddend;
-using oracle_stone_locator_profile::kObjectItemsOffset;
-using oracle_stone_locator_profile::kObjectCountOffset;
-using oracle_stone_locator_profile::kObjectMaxCountOffset;
-using oracle_stone_locator_profile::kObjectMaxChunksOffset;
-using oracle_stone_locator_profile::kObjectNumChunksOffset;
-using oracle_stone_locator_profile::kObjectChunkSize;
-using oracle_stone_locator_profile::kObjectItemStride;
-using oracle_stone_locator_profile::kWorldGameInstanceOffset;
-using oracle_stone_locator_profile::kGameInstanceLocalPlayersOffset;
-using oracle_stone_locator_profile::kLocalPlayerControllerOffset;
-using oracle_stone_locator_profile::kControllerPlayerStateOffset;
-using oracle_stone_locator_profile::kDataTableRowMapOffset;
-using oracle_stone_locator_profile::kDataTableRowMapElementStride;
-using oracle_stone_locator_profile::kDataTableRowMapRowOffset;
-using oracle_stone_locator_profile::kDataTableRowMapData;
-using oracle_stone_locator_profile::kDataTableRowMapNum;
-using oracle_stone_locator_profile::kDataTableRowMapMax;
-using oracle_stone_locator_profile::kDataTableRowMapInlineFlags;
-using oracle_stone_locator_profile::kDataTableRowMapFlagsData;
-using oracle_stone_locator_profile::kDataTableRowMapFlagsNum;
-using oracle_stone_locator_profile::kDataTableRowMapFlagsMax;
 using oracle_stone_locator_profile::kDataTableMaxRows;
-using oracle_stone_locator_profile::kOracleStoneDataAssetTableOffset;
-using oracle_stone_locator_profile::kOracleStoneLevelOffset;
-using oracle_stone_locator_profile::kOracleStoneFloorOffset;
-using oracle_stone_locator_profile::kOracleStoneLocationOffset;
-using oracle_stone_locator_profile::kOracleStoneMapExploreOffset;
 using oracle_stone_locator_profile::kTreasureboxDataAssetPath;
 
 using oracle_stone_locator::OracleStoneUnknown;
@@ -965,14 +954,8 @@ bool OracleResolveRipRelative(const AnomalySignatureServiceV1* signature,
                               std::uintptr_t& address) noexcept {
     address = 0;
     if (!SignatureReady(signature)) return false;
-    std::uintptr_t instruction{};
-    if (signature->resolve(signature->user, anomaly::sdk::StringView("HTGame.exe"),
-                           anomaly::sdk::StringView(".text"),
-                           anomaly::sdk::StringView(pattern), &instruction)
-            .code != ANOMALY_STATUS_V1_OK ||
-        instruction == 0) {
-        return false;
-    }
+    const auto instruction = compatibility.Address(pattern);
+    if (instruction == 0) return false;
     std::int32_t displacement{};
     if (!Read(reinterpret_cast<const void*>(instruction + kRipDisplacementOffset),
               displacement)) {
@@ -1015,7 +998,7 @@ bool OracleRefreshObjectRegistry(Context& context) noexcept {
     if (context.g_objects_address == 0) {
         if (!OracleGateOpen(context.objects_gate)) return false;
         if (!OracleResolveRipRelative(context.signature, kGObjectsPattern,
-                                      kGObjectsAddend, context.g_objects_address)) {
+                                      native_layout.kGObjectsAddend, context.g_objects_address)) {
             OracleGateFailed(context, context.objects_gate, "GObjects signature");
             return false;
         }
@@ -1023,16 +1006,16 @@ bool OracleRefreshObjectRegistry(Context& context) noexcept {
     }
     ObjectRegistry next{};
     if (!Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectItemsOffset), next.items) ||
+                  context.g_objects_address + native_layout.kObjectItemsOffset), next.items) ||
         next.items == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectCountOffset), next.count) ||
+                  context.g_objects_address + native_layout.kObjectCountOffset), next.count) ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectMaxCountOffset), next.max_count) ||
+                  context.g_objects_address + native_layout.kObjectMaxCountOffset), next.max_count) ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectMaxChunksOffset), next.max_chunks) ||
+                  context.g_objects_address + native_layout.kObjectMaxChunksOffset), next.max_chunks) ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectNumChunksOffset), next.num_chunks) ||
+                  context.g_objects_address + native_layout.kObjectNumChunksOffset), next.num_chunks) ||
         next.count == 0 || next.count > kMaximumObjectCount ||
         next.max_count < next.count || next.num_chunks == 0 ||
         next.num_chunks > next.max_chunks ||
@@ -1049,8 +1032,8 @@ bool OracleObjectFromHandle(Context& context,
     object = 0;
     if (!OracleRefreshObjectRegistry(context)) return false;
     const std::uint32_t index = ANOMALY_UE5_OBJECT_HANDLE_INDEX(handle);
-    const std::uint32_t chunk_index = index / kObjectChunkSize;
-    const std::uint32_t within_chunk = index % kObjectChunkSize;
+    const std::uint32_t chunk_index = index / native_layout.kObjectChunkSize;
+    const std::uint32_t within_chunk = index % native_layout.kObjectChunkSize;
     if (index >= context.registry.count ||
         chunk_index >= context.registry.num_chunks) {
         return false;
@@ -1061,7 +1044,7 @@ bool OracleObjectFromHandle(Context& context,
     if (!chunk) return false;
     return Read(reinterpret_cast<const void*>(
                     reinterpret_cast<std::uintptr_t>(chunk) +
-                    static_cast<std::uintptr_t>(within_chunk) * kObjectItemStride),
+                    static_cast<std::uintptr_t>(within_chunk) * native_layout.kObjectItemStride),
                 object) &&
         object != 0;
 }
@@ -1099,18 +1082,18 @@ bool OracleResolvePlayerState(Context& context) noexcept {
     if (!Read(reinterpret_cast<const void*>(context.g_world_address), world) ||
         world == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  world + kWorldGameInstanceOffset), game_instance) ||
+                  world + native_layout.kWorldGameInstanceOffset), game_instance) ||
         game_instance == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  game_instance + kGameInstanceLocalPlayersOffset), local_players) ||
+                  game_instance + native_layout.kGameInstanceLocalPlayersOffset), local_players) ||
         local_players == 0 ||
         !Read(reinterpret_cast<const void*>(local_players), local_player) ||
         local_player == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  local_player + kLocalPlayerControllerOffset), controller) ||
+                  local_player + native_layout.kLocalPlayerControllerOffset), controller) ||
         controller == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  controller + kControllerPlayerStateOffset), context.player_state) ||
+                  controller + native_layout.kControllerPlayerStateOffset), context.player_state) ||
         context.player_state == 0) {
         return false;
     }
@@ -1127,7 +1110,7 @@ bool OracleScanCatalog(Context& context) {
         return false;
     }
     if (!Read(reinterpret_cast<const void*>(
-                  context.treasure_asset + kOracleStoneDataAssetTableOffset),
+                  context.treasure_asset + native_layout.kOracleStoneDataAssetTableOffset),
               context.data_table) ||
         context.data_table == 0) {
         OracleGateFailed(context, context.scan_gate, "oracle data table read");
@@ -1140,19 +1123,19 @@ bool OracleScanCatalog(Context& context) {
     std::int32_t flags_num{};
     std::int32_t flags_max{};
     if (!Read(reinterpret_cast<const void*>(
-                  context.data_table + kDataTableRowMapOffset + kDataTableRowMapData), data) ||
+                  context.data_table + native_layout.kDataTableRowMapOffset + native_layout.kDataTableRowMapData), data) ||
         !Read(reinterpret_cast<const void*>(
-                  context.data_table + kDataTableRowMapOffset + kDataTableRowMapNum), num) ||
+                  context.data_table + native_layout.kDataTableRowMapOffset + native_layout.kDataTableRowMapNum), num) ||
         !Read(reinterpret_cast<const void*>(
-                  context.data_table + kDataTableRowMapOffset + kDataTableRowMapMax), max) ||
+                  context.data_table + native_layout.kDataTableRowMapOffset + native_layout.kDataTableRowMapMax), max) ||
         !Read(reinterpret_cast<const void*>(
-                  context.data_table + kDataTableRowMapOffset + kDataTableRowMapFlagsData),
+                  context.data_table + native_layout.kDataTableRowMapOffset + native_layout.kDataTableRowMapFlagsData),
               flags_data) ||
         !Read(reinterpret_cast<const void*>(
-                  context.data_table + kDataTableRowMapOffset + kDataTableRowMapFlagsNum),
+                  context.data_table + native_layout.kDataTableRowMapOffset + native_layout.kDataTableRowMapFlagsNum),
               flags_num) ||
         !Read(reinterpret_cast<const void*>(
-                  context.data_table + kDataTableRowMapOffset + kDataTableRowMapFlagsMax),
+                  context.data_table + native_layout.kDataTableRowMapOffset + native_layout.kDataTableRowMapFlagsMax),
               flags_max) ||
         data == 0 || num <= 0 || num > kDataTableMaxRows || max < num ||
         flags_num < num || flags_max < flags_num) {
@@ -1172,8 +1155,8 @@ bool OracleScanCatalog(Context& context) {
         }
     } else if (word_count > 4 ||
                !ReadBytes(reinterpret_cast<const void*>(
-                              context.data_table + kDataTableRowMapOffset +
-                              kDataTableRowMapInlineFlags),
+                              context.data_table + native_layout.kDataTableRowMapOffset +
+                              native_layout.kDataTableRowMapInlineFlags),
                           flags.data(), flags.size() * sizeof(std::uint32_t))) {
         return false;
     }
@@ -1181,12 +1164,12 @@ bool OracleScanCatalog(Context& context) {
     discovered.reserve(static_cast<std::size_t>(num));
     for (std::int32_t index{}; index < num; ++index) {
         const std::size_t element_offset =
-            static_cast<std::size_t>(index) * kDataTableRowMapElementStride;
+            static_cast<std::size_t>(index) * native_layout.kDataTableRowMapElementStride;
         FNameValue id_name{};
         std::uintptr_t row{};
         if (!Read(reinterpret_cast<const void*>(data + element_offset), id_name) ||
             !Read(reinterpret_cast<const void*>(
-                      data + element_offset + kDataTableRowMapRowOffset), row) ||
+                      data + element_offset + native_layout.kDataTableRowMapRowOffset), row) ||
             id_name.comparison_index == 0 || row == 0) {
             continue;
         }
@@ -1195,12 +1178,12 @@ bool OracleScanCatalog(Context& context) {
         record.oracle_stone_id = OracleRenderFName(context.names, id_name);
         if (record.oracle_stone_id.empty()) continue;
         std::string level;
-        if (OracleReadFString(row + kOracleStoneLevelOffset, level)) {
+        if (OracleReadFString(row + native_layout.kOracleStoneLevelOffset, level)) {
             record.level = std::move(level);
         }
-        if (!Read(reinterpret_cast<const void*>(row + kOracleStoneFloorOffset),
+        if (!Read(reinterpret_cast<const void*>(row + native_layout.kOracleStoneFloorOffset),
                   record.floor) ||
-            !Read(reinterpret_cast<const void*>(row + kOracleStoneLocationOffset),
+            !Read(reinterpret_cast<const void*>(row + native_layout.kOracleStoneLocationOffset),
                   record.world_position) ||
             !std::isfinite(record.world_position[0]) ||
             !std::isfinite(record.world_position[1]) ||
@@ -1382,7 +1365,7 @@ void OracleInitialize(Context& context, const AnomalyHostApiV1* host) {
 std::string ObjectName(const AnomalyUe5NamesServiceV1* names,
                        const std::uintptr_t object) noexcept {
     std::uint32_t name_id{};
-    if (!Read(reinterpret_cast<const void*>(object + kObjectNameOffset), name_id)) {
+    if (!Read(reinterpret_cast<const void*>(object + native_layout.kObjectNameOffset), name_id)) {
         return {};
     }
     return ResolveName(names, name_id);
@@ -1394,20 +1377,20 @@ bool FindFunction(const AnomalyUe5NamesServiceV1* names, const std::uintptr_t cl
     std::uintptr_t owner = cls;
     for (std::uint32_t depth{}; owner != 0 && depth < 64; ++depth) {
         std::uintptr_t field{};
-        Read(reinterpret_cast<const void*>(owner + kUStructChildrenOffset), field);
+        Read(reinterpret_cast<const void*>(owner + native_layout.kUStructChildrenOffset), field);
         for (std::uint32_t count{}; field != 0 && count < 4096; ++count) {
             std::uintptr_t next{};
             std::uintptr_t field_class{};
-            if (!Read(reinterpret_cast<const void*>(field + kUFieldNextOffset), next) ||
-                !Read(reinterpret_cast<const void*>(field + kObjectClassOffset), field_class)) {
+            if (!Read(reinterpret_cast<const void*>(field + native_layout.kUFieldNextOffset), next) ||
+                !Read(reinterpret_cast<const void*>(field + native_layout.kObjectClassOffset), field_class)) {
                 break;
             }
             if (ObjectName(names, field_class) == "Function" &&
                 ObjectName(names, field) == target) {
                 std::uint8_t np{};
                 std::uint16_t ps{};
-                Read(reinterpret_cast<const void*>(field + kUFunctionNumParmsOffset), np);
-                Read(reinterpret_cast<const void*>(field + kUFunctionParmsSizeOffset), ps);
+                Read(reinterpret_cast<const void*>(field + native_layout.kUFunctionNumParmsOffset), np);
+                Read(reinterpret_cast<const void*>(field + native_layout.kUFunctionParmsSizeOffset), ps);
                 if (np == num_parms && ps == parms_size) {
                     result = field;
                     return true;
@@ -1417,7 +1400,7 @@ bool FindFunction(const AnomalyUe5NamesServiceV1* names, const std::uintptr_t cl
             field = next;
         }
         std::uintptr_t super{};
-        if (!Read(reinterpret_cast<const void*>(owner + kUStructSuperStructOffset), super) ||
+        if (!Read(reinterpret_cast<const void*>(owner + native_layout.kUStructSuperStructOffset), super) ||
             super == 0 || super == owner) {
             break;
         }
@@ -1429,28 +1412,28 @@ bool FindFunction(const AnomalyUe5NamesServiceV1* names, const std::uintptr_t cl
 // Offset of a reflected property, looked up by name on `cls` and its supers
 // (UStruct::PropertyLink -> FProperty::PropertyLinkNext). Used instead of a
 // hard-coded offset for fields whose position moves between builds.
-constexpr std::ptrdiff_t kUStructPropertyLinkOffset = 112;
-constexpr std::ptrdiff_t kFPropertyLinkNextOffset = 72;
-constexpr std::ptrdiff_t kFFieldNameOffset = 32;
-constexpr std::ptrdiff_t kFPropertyOffsetInternalOffset = 68;
+
+
+
+
 
 bool FindPropertyOffset(const AnomalyUe5NamesServiceV1* names, const std::uintptr_t cls,
                         const std::string_view target, std::int32_t& offset) noexcept {
     std::uintptr_t owner = cls;
     for (std::uint32_t depth{}; owner != 0 && depth < 64; ++depth) {
         std::uintptr_t property{};
-        Read(reinterpret_cast<const void*>(owner + kUStructPropertyLinkOffset), property);
+        Read(reinterpret_cast<const void*>(owner + native_layout.kUStructPropertyLinkOffset), property);
         for (std::uint32_t count{}; property != 0 && count < 4096; ++count) {
             std::uint32_t name_id{};
-            if (Read(reinterpret_cast<const void*>(property + kFFieldNameOffset), name_id) &&
+            if (Read(reinterpret_cast<const void*>(property + native_layout.kFFieldNameOffset), name_id) &&
                 ResolveName(names, name_id) == target &&
-                Read(reinterpret_cast<const void*>(property + kFPropertyOffsetInternalOffset),
+                Read(reinterpret_cast<const void*>(property + native_layout.kFPropertyOffsetInternalOffset),
                      offset) &&
                 offset > 0) {
                 return true;
             }
             std::uintptr_t next{};
-            if (!Read(reinterpret_cast<const void*>(property + kFPropertyLinkNextOffset), next) ||
+            if (!Read(reinterpret_cast<const void*>(property + native_layout.kFPropertyLinkNextOffset), next) ||
                 next == property) {
                 break;
             }
@@ -1459,7 +1442,7 @@ bool FindPropertyOffset(const AnomalyUe5NamesServiceV1* names, const std::uintpt
         // PropertyLink already walks inherited properties; the super chain is
         // only a fallback for classes whose link is not built yet.
         std::uintptr_t super{};
-        if (!Read(reinterpret_cast<const void*>(owner + kUStructSuperStructOffset), super) ||
+        if (!Read(reinterpret_cast<const void*>(owner + native_layout.kUStructSuperStructOffset), super) ||
             super == 0 || super == owner) {
             break;
         }
@@ -1476,28 +1459,28 @@ bool FindPropertyOffset(const AnomalyUe5NamesServiceV1* names, const std::uintpt
 // fallback when reflection is unavailable.
 std::ptrdiff_t InteractFinishOffset(Context& context, const std::uintptr_t actor) noexcept {
     std::uintptr_t cls{};
-    if (actor == 0 || !Read(reinterpret_cast<const void*>(actor + kObjectClassOffset), cls) ||
+    if (actor == 0 || !Read(reinterpret_cast<const void*>(actor + native_layout.kObjectClassOffset), cls) ||
         cls == 0) {
-        return kInteractFinishOffset;
+        return native_layout.kInteractFinishOffset;
     }
     const auto cached = context.interact_finish_offsets.find(cls);
     if (cached != context.interact_finish_offsets.end()) return cached->second;
     std::int32_t offset{};
     const std::ptrdiff_t resolved =
         FindPropertyOffset(context.names, cls, "bInteractFinish", offset) ? offset
-                                                                           : kInteractFinishOffset;
+                                                                           : native_layout.kInteractFinishOffset;
     context.interact_finish_offsets.emplace(cls, resolved);
     return resolved;
 }
 
-bool Invoke(void* object, void* function, void* parameters) noexcept {
+bool Invoke(Context& context, void* object, void* function, void* parameters) noexcept {
     if (!object || !function) return false;
     using ProcessEvent = void(__fastcall*)(void*, void*, void*);
     auto vtable = ReadPointer(object);
     if (!vtable) return false;
     auto process_event = ReadPointer(reinterpret_cast<const std::uint8_t*>(vtable) +
-        kProcessEventVtableIndex * sizeof(void*));
-    if (!process_event) return false;
+        native_layout.kProcessEventVtableIndex * sizeof(void*));
+    if (!box_auto_compat::compatibility.MatchesEntry(context.core, "ProcessEvent.entry", reinterpret_cast<std::uintptr_t>(process_event), true)) return false;
     __try {
         reinterpret_cast<ProcessEvent>(process_event)(object, function, parameters);
         return true;
@@ -1520,7 +1503,7 @@ bool InvokeNative(Context& context, void* object, void* function,
                   void* parameters) noexcept {
     if (!object || !function) return false;
     const auto flags_address =
-        reinterpret_cast<std::uintptr_t>(function) + kUFunctionFlagsOffset;
+        reinterpret_cast<std::uintptr_t>(function) + native_layout.kUFunctionFlagsOffset;
     std::uint32_t original_flags{};
     if (!Read(reinterpret_cast<const void*>(flags_address), original_flags)) {
         return false;
@@ -1530,7 +1513,7 @@ bool InvokeNative(Context& context, void* object, void* function,
                      invocation_flags)) {
         return false;
     }
-    const bool invoked = Invoke(object, function, parameters);
+    const bool invoked = Invoke(context, object, function, parameters);
     static_cast<void>(WriteUint32(reinterpret_cast<const void*>(flags_address),
                                   original_flags));
     return invoked;
@@ -1549,7 +1532,7 @@ bool FindExactObject(Context& context, const std::string_view path,
     }
     const auto index = ANOMALY_UE5_OBJECT_HANDLE_INDEX(handle);
     if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
                             context.g_objects_address)) {
         return false;
     }
@@ -1569,6 +1552,8 @@ constexpr std::string_view CategoryForChoice(const std::uint32_t choice) noexcep
         case 8: return "prison";
         case 9: return "wallet";
         case 11: return "shop_steal";
+        case 12: return "safe";
+        case 13: return "locker_key";
         default: return "";
     }
 }
@@ -1585,6 +1570,8 @@ constexpr std::string_view ActorPrefixForChoice(const std::uint32_t choice) noex
         case 8: return "Prison";
         case 9: return "InteractBox";
         case 11: return "ShopStealGoods_";
+        case 12: return "WorldSafeBox";
+        case 13: return "CabinetKey";
         default: return "";
     }
 }
@@ -1601,6 +1588,8 @@ constexpr std::string_view ActorPrefixForCategory(
     if (category == "prison") return "PropBox_Once";
     if (category == "wallet") return "InteractBox";
     if (category == "shop_steal") return "ShopStealGoods_";
+    if (category == "safe") return "WorldSafeBox";
+    if (category == "locker_key") return "CabinetKey";
     return "";
 }
 
@@ -1667,7 +1656,7 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points,
         context.objects->user, anomaly::sdk::StringView(kRandomItemTablePath), &handle);
     if (st.code != ANOMALY_STATUS_V1_OK || handle.id == 0) return;
     if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
                             context.g_objects_address)) {
         return;
     }
@@ -1681,14 +1670,14 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points,
     } header;
     if (!Read(reinterpret_cast<const void*>(
                   reinterpret_cast<std::uintptr_t>(table_object) +
-                      kDataTableRowMapOffset),
+                      native_layout.kDataTableRowMapOffset),
               header) ||
         header.count <= 0 || header.capacity < header.count || header.data == 0) {
         return;
     }
     for (std::int32_t i = 0; i < header.count; ++i) {
         const auto element =
-            header.data + static_cast<std::uintptr_t>(i) * kDataTableRowStride;
+            header.data + static_cast<std::uintptr_t>(i) * native_layout.kDataTableRowStride;
         RawName row_id{};
         std::uintptr_t row{};
         if (!Read(reinterpret_cast<const void*>(element), row_id) ||
@@ -1696,18 +1685,18 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points,
             continue;
         }
         if (!Read(reinterpret_cast<const void*>(
-                      element + kDataTableRowPointerOffset),
+                      element + native_layout.kDataTableRowPointerOffset),
                   row) ||
             row == 0) {
             continue;
         }
         double x{}, y{}, z{};
-        Read(reinterpret_cast<const void*>(row + kRandomItemCoordOffset), x);
-        Read(reinterpret_cast<const void*>(row + kRandomItemCoordOffset + 8), y);
-        Read(reinterpret_cast<const void*>(row + kRandomItemCoordOffset + 16), z);
+        Read(reinterpret_cast<const void*>(row + native_layout.kRandomItemCoordOffset), x);
+        Read(reinterpret_cast<const void*>(row + native_layout.kRandomItemCoordOffset + 8), y);
+        Read(reinterpret_cast<const void*>(row + native_layout.kRandomItemCoordOffset + 16), z);
         if (x == 0.0 && y == 0.0 && z == 0.0) continue;
         std::uint32_t type_id{};
-        if (!Read(reinterpret_cast<const void*>(row + kRandomItemTypeOffset),
+        if (!Read(reinterpret_cast<const void*>(row + native_layout.kRandomItemTypeOffset),
                   type_id) ||
             type_id == 0) {
             continue;
@@ -1763,13 +1752,17 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points,
 
 void LogBox(Context& context, const std::string& message);
 bool FoodGroupOf(const std::string_view name, std::string& key);
+void ReadSafeTable(Context& context, std::vector<Point>& points);
+void CollectLockerKeys(Context& context, std::vector<Point>& points);
 
 void ReadTable(Context& context) {
     std::vector<Point> points;
     void* table_object{};
     if (!ObjectsReady(context.objects)) {
         std::lock_guard<std::mutex> lock(context.mutex);
-        context.status = "读表失败：objects 服务不可用";
+        context.status = context.localizer.Text(
+            "status.read_failed_objects",
+            "Read table failed: the objects service is unavailable");
         return;
     }
     AnomalyGenerationHandleV1 handle{};
@@ -1777,22 +1770,32 @@ void ReadTable(Context& context) {
         context.objects->user, anomaly::sdk::StringView(kEnvTablePath), &handle);
     if (st.code != ANOMALY_STATUS_V1_OK || handle.id == 0) {
         std::lock_guard<std::mutex> lock(context.mutex);
-        context.status = "读表失败：find_exact code=" + std::to_string(st.code);
+        const std::string code_str = std::to_string(st.code);
+        const std::array code_args{std::string_view(code_str)};
+        context.status = context.localizer.Format(
+            "status.read_failed_find_exact",
+            "Read table failed: find_exact code={0}", code_args);
         return;
     }
     if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
                             context.g_objects_address)) {
         std::lock_guard<std::mutex> lock(context.mutex);
-        context.status = "读表失败：GObjects 解析失败";
+        context.status = context.localizer.Text(
+            "status.read_failed_gobjects",
+            "Read table failed: could not resolve GObjects");
         return;
     }
     const auto index = ANOMALY_UE5_OBJECT_HANDLE_INDEX(handle);
     table_object = ObjectAt(context.g_objects_address, index);
     if (table_object == nullptr) {
         std::lock_guard<std::mutex> lock(context.mutex);
-        context.status = "读表失败：ObjectAt 返回空 handle.id=" +
-            std::to_string(handle.id);
+        const std::string handle_id_str = std::to_string(handle.id);
+        const std::array handle_args{std::string_view(handle_id_str)};
+        context.status = context.localizer.Format(
+            "status.read_failed_object_at",
+            "Read table failed: ObjectAt returned an empty handle (id={0})",
+            handle_args);
         return;
     }
     struct ArrayHeader {
@@ -1801,26 +1804,28 @@ void ReadTable(Context& context) {
         std::int32_t capacity{};
     } header;
     if (!Read(reinterpret_cast<const void*>(
-                  reinterpret_cast<std::uintptr_t>(table_object) + kDataTableRowMapOffset),
+                  reinterpret_cast<std::uintptr_t>(table_object) + native_layout.kDataTableRowMapOffset),
               header) ||
         header.count <= 0 || header.capacity < header.count || header.data == 0) {
         std::lock_guard<std::mutex> lock(context.mutex);
-        context.status = "读表失败：RowMap 读取失败";
+        context.status = context.localizer.Text(
+            "status.read_failed_row_map",
+            "Read table failed: could not read the row map");
         return;
     }
     for (std::int32_t i = 0; i < header.count; ++i) {
         const auto element = header.data +
-            static_cast<std::uintptr_t>(i) * kDataTableRowStride;
+            static_cast<std::uintptr_t>(i) * native_layout.kDataTableRowStride;
         RawName row_id{};
         std::uintptr_t row{};
         if (!Read(reinterpret_cast<const void*>(element), row_id) ||
             row_id.comparison_index == 0) continue;
-        if (!Read(reinterpret_cast<const void*>(element + kDataTableRowPointerOffset),
+        if (!Read(reinterpret_cast<const void*>(element + native_layout.kDataTableRowPointerOffset),
                   row) || row == 0) continue;
         double x{}, y{}, z{};
-        Read(reinterpret_cast<const void*>(row + kCoordOffset), x);
-        Read(reinterpret_cast<const void*>(row + kCoordOffset + 8), y);
-        Read(reinterpret_cast<const void*>(row + kCoordOffset + 16), z);
+        Read(reinterpret_cast<const void*>(row + native_layout.kCoordOffset), x);
+        Read(reinterpret_cast<const void*>(row + native_layout.kCoordOffset + 8), y);
+        Read(reinterpret_cast<const void*>(row + native_layout.kCoordOffset + 16), z);
         if (x == 0.0 && y == 0.0 && z == 0.0) continue;
         Point p;
         p.row_name = ResolveName(
@@ -1849,6 +1854,8 @@ void ReadTable(Context& context) {
     }
     std::vector<Point> all_random_points;
     ReadRandomItemTable(context, points, all_random_points);
+    ReadSafeTable(context, points);
+    CollectLockerKeys(context, points);
     std::lock_guard<std::mutex> lock(context.mutex);
     context.points = std::move(points);
     context.all_points = std::move(all_random_points);
@@ -1906,7 +1913,7 @@ bool ResolvePlayerState(Context& context, std::uintptr_t& player_state) noexcept
     player_state = 0;
     if (context.controller == 0) return false;
     return Read(reinterpret_cast<const void*>(
-                    context.controller + kControllerPlayerStateOffset),
+                    context.controller + native_layout.kControllerPlayerStateOffset),
                 player_state) &&
         player_state != 0;
 }
@@ -1960,7 +1967,7 @@ bool ResolveRandomItemRecords(Context& context) noexcept {
     if (!Read(reinterpret_cast<const void*>(owner_address), owner_vtable) ||
         owner_vtable == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  owner_vtable + kRecordOwnerFindRecordVtableOffset),
+                  owner_vtable + native_layout.kRecordOwnerFindRecordVtableOffset),
               find_record_address) ||
         find_record_address == 0) {
         return false;
@@ -1980,25 +1987,25 @@ bool ReadRecordSelections(const std::uintptr_t record,
     if (record == 0) return false;
     std::uintptr_t owner{};
     std::int32_t record_index{};
-    if (!Read(reinterpret_cast<const void*>(record + kRecordOwnerOffset), owner) ||
+    if (!Read(reinterpret_cast<const void*>(record + native_layout.kRecordOwnerOffset), owner) ||
         owner == 0 ||
-        !Read(reinterpret_cast<const void*>(record + kRecordIndexOffset),
+        !Read(reinterpret_cast<const void*>(record + native_layout.kRecordIndexOffset),
               record_index) ||
         record_index < 0 || record_index > 4096) {
         return false;
     }
     std::uintptr_t descriptors{};
     if (!Read(reinterpret_cast<const void*>(
-                  owner + kRecordDescriptorTableOffset), descriptors) ||
+                  owner + native_layout.kRecordDescriptorTableOffset), descriptors) ||
         descriptors == 0) {
         return false;
     }
     const std::uintptr_t descriptor =
         descriptors +
-        static_cast<std::uintptr_t>(record_index) * kRecordDescriptorStride;
+        static_cast<std::uintptr_t>(record_index) * native_layout.kRecordDescriptorStride;
     std::uintptr_t store{};
     if (!Read(reinterpret_cast<const void*>(
-                  descriptor + kRecordDescriptorStoreOffset), store) ||
+                  descriptor + native_layout.kRecordDescriptorStoreOffset), store) ||
         store == 0) {
         return false;
     }
@@ -2007,7 +2014,7 @@ bool ReadRecordSelections(const std::uintptr_t record,
         std::int32_t count{};
         std::int32_t capacity{};
     } rows;
-    if (!Read(reinterpret_cast<const void*>(store + kRecordStoreRowsOffset),
+    if (!Read(reinterpret_cast<const void*>(store + native_layout.kRecordStoreRowsOffset),
               rows) ||
         rows.count < 0 ||
         rows.count > static_cast<std::int32_t>(kMaximumRecordRows) ||
@@ -2026,7 +2033,7 @@ bool ReadRecordSelections(const std::uintptr_t record,
     std::uintptr_t get_string_address{};
     if (!Read(reinterpret_cast<const void*>(record), vtable) || vtable == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  vtable + kRecordGetStringVtableOffset), get_string_address) ||
+                  vtable + native_layout.kRecordGetStringVtableOffset), get_string_address) ||
         get_string_address == 0) {
         return false;
     }
@@ -2048,6 +2055,179 @@ bool ReadRecordSelections(const std::uintptr_t record,
 void LogBox(Context& context, const std::string& message) {
     const auto* core = anomaly::sdk::Host(context.host).Query<AnomalyCoreServiceV1>(ANOMALY_CORE_SERVICE_V1_ID, 1).get();
     if (core && core->log) core->log(core->user, ANOMALY_CORE_LOG_LEVEL_V1_INFO, anomaly::sdk::StringView("box-auto " + message));
+}
+
+// The map's safe point table lists every world safe, opened or not, whether or not its cell is
+// loaded. A point already confirmed as opened is dropped here, so the walk never revisits it.
+void ReadSafeTable(Context& context, std::vector<Point>& points) {
+    if (!ObjectsReady(context.objects)) return;
+    AnomalyGenerationHandleV1 handle{};
+    const auto st = context.objects->find_exact(
+        context.objects->user, anomaly::sdk::StringView(kSafeTablePath), &handle);
+    if (st.code != ANOMALY_STATUS_V1_OK || handle.id == 0) {
+        LogBox(context, "safe table not found");
+        return;
+    }
+    if (context.g_objects_address == 0 &&
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
+                            context.g_objects_address)) {
+        return;
+    }
+    const void* table_object =
+        ObjectAt(context.g_objects_address, ANOMALY_UE5_OBJECT_HANDLE_INDEX(handle));
+    if (table_object == nullptr) return;
+    struct ArrayHeader {
+        std::uintptr_t data{};
+        std::int32_t count{};
+        std::int32_t capacity{};
+    } header;
+    if (!Read(reinterpret_cast<const void*>(
+                  reinterpret_cast<std::uintptr_t>(table_object) +
+                  native_layout.kDataTableRowMapOffset),
+              header) ||
+        header.count <= 0 || header.capacity < header.count || header.data == 0) {
+        LogBox(context, "safe table row map unreadable");
+        return;
+    }
+    std::size_t read{};
+    for (std::int32_t i = 0; i < header.count; ++i) {
+        const auto element = header.data +
+            static_cast<std::uintptr_t>(i) * native_layout.kDataTableRowStride;
+        RawName row_id{};
+        std::uintptr_t row{};
+        if (!Read(reinterpret_cast<const void*>(element), row_id) ||
+            row_id.comparison_index == 0) {
+            continue;
+        }
+        if (!Read(reinterpret_cast<const void*>(element + native_layout.kDataTableRowPointerOffset),
+                  row) || row == 0) {
+            continue;
+        }
+        Point p;
+        p.row_name = ResolveName(
+            context.names, static_cast<std::uint32_t>(row_id.comparison_index));
+        if (p.row_name.empty() || p.row_name.find(kSafeRowPrefix) != 0) continue;
+        if (row_id.number != 0) {
+            p.row_name.push_back('_');
+            p.row_name += std::to_string(row_id.number - 1U);
+        }
+        double x{}, y{}, z{};
+        Read(reinterpret_cast<const void*>(row + native_layout.kSafeTableCoordOffset), x);
+        Read(reinterpret_cast<const void*>(row + native_layout.kSafeTableCoordOffset + 8), y);
+        Read(reinterpret_cast<const void*>(row + native_layout.kSafeTableCoordOffset + 16), z);
+        if (x == 0.0 && y == 0.0 && z == 0.0) continue;
+        // A point already confirmed as opened stays out of the walk for the whole session.
+        if (context.safe_opened_points.find(p.row_name) !=
+            context.safe_opened_points.end()) {
+            continue;
+        }
+        p.x = x;
+        p.y = y;
+        p.z = z;
+        p.category = "safe";
+        ++read;
+        points.push_back(std::move(p));
+    }
+    LogBox(context, "safe table rows=" + std::to_string(read));
+}
+
+// A key that was just streamed in can still sit at the origin for a moment, so a point read there
+// would teleport the player to the middle of the map; those reads are dropped instead.
+void CollectLockerKeys(Context& context, std::vector<Point>& points) {
+    if (context.g_objects_address == 0 &&
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
+                            context.g_objects_address)) {
+        return;
+    }
+    std::int32_t count{};
+    std::int32_t num_chunks{};
+    std::uintptr_t items{};
+    if (!Read(reinterpret_cast<const void*>(context.g_objects_address +
+                                            native_layout.kObjectItemsOffset), items) ||
+        items == 0 ||
+        !Read(reinterpret_cast<const void*>(context.g_objects_address +
+                                            native_layout.kObjectCountOffset), count) ||
+        !Read(reinterpret_cast<const void*>(context.g_objects_address +
+                                            native_layout.kObjectNumChunksOffset), num_chunks) ||
+        count <= 0 || num_chunks <= 0) {
+        return;
+    }
+    std::unordered_map<std::uintptr_t, bool> class_cache;
+    std::uint32_t current_chunk = 0xFFFFFFFFu;
+    std::uintptr_t chunk{};
+    std::size_t added{};
+    std::size_t degenerate{};
+    for (std::int32_t i = 0; i < count; ++i) {
+        const auto chunk_index = static_cast<std::uint32_t>(i) / native_layout.kObjectChunkSize;
+        if (chunk_index != current_chunk) {
+            current_chunk = chunk_index;
+            if (!Read(reinterpret_cast<const void*>(
+                          items + static_cast<std::uintptr_t>(chunk_index) * sizeof(void*)),
+                      chunk) ||
+                chunk == 0) {
+                continue;
+            }
+        }
+        const auto within = static_cast<std::uint32_t>(i) % native_layout.kObjectChunkSize;
+        std::uintptr_t object{};
+        if (!Read(reinterpret_cast<const void*>(
+                      chunk + static_cast<std::uintptr_t>(within) * native_layout.kObjectItemStride),
+                  object) ||
+            object == 0) {
+            continue;
+        }
+        std::uintptr_t cls{};
+        if (!Read(reinterpret_cast<const void*>(object + native_layout.kObjectClassOffset), cls) ||
+            cls == 0) {
+            continue;
+        }
+        const auto cached = class_cache.find(cls);
+        bool is_key{};
+        if (cached != class_cache.end()) {
+            is_key = cached->second;
+        } else {
+            is_key = ObjectName(context.names, cls).find(kKeyClassNeedle) != std::string::npos;
+            class_cache[cls] = is_key;
+        }
+        if (!is_key) continue;
+        // The class default object has no root component, but checking it explicitly keeps the
+        // sweep from ever turning the template into a point.
+        std::uintptr_t cdo{};
+        if (Read(reinterpret_cast<const void*>(cls + native_layout.kUClassDefaultObjectOffset),
+                 cdo) &&
+            cdo == object) {
+            continue;
+        }
+        std::uintptr_t root{};
+        if (!Read(reinterpret_cast<const void*>(object + native_layout.kActorRootComponentOffset),
+                  root) ||
+            root == 0) {
+            continue;
+        }
+        double x{}, y{}, z{};
+        if (!Read(reinterpret_cast<const void*>(root + native_layout.kSceneComponentLocationOffset),
+                  x) ||
+            !Read(reinterpret_cast<const void*>(
+                      root + native_layout.kSceneComponentLocationOffset + 8), y) ||
+            !Read(reinterpret_cast<const void*>(
+                      root + native_layout.kSceneComponentLocationOffset + 16), z)) {
+            continue;
+        }
+        if (std::abs(x) < 1.0 && std::abs(y) < 1.0) {
+            ++degenerate;
+            continue;
+        }
+        Point p;
+        p.row_name = ObjectName(context.names, object);
+        p.x = x;
+        p.y = y;
+        p.z = z;
+        p.category = "locker_key";
+        points.push_back(std::move(p));
+        ++added;
+    }
+    LogBox(context, "key sweep added=" + std::to_string(added) +
+                        " degenerate=" + std::to_string(degenerate));
 }
 
 bool FoodGroupOf(const std::string_view name, std::string& key) {
@@ -2275,17 +2455,17 @@ bool GetPlayerController(Context& context) noexcept {
         return false;
     }
     std::uintptr_t game_instance{};
-    if (!Read(reinterpret_cast<const void*>(world + kWorldGameInstanceOffset),
+    if (!Read(reinterpret_cast<const void*>(world + native_layout.kWorldGameInstanceOffset),
               game_instance) || game_instance == 0) {
         return false;
     }
     std::uintptr_t players_array{};
     std::int32_t players_count{};
     if (!Read(reinterpret_cast<const void*>(
-                  game_instance + kGameInstanceLocalPlayersOffset), players_array) ||
+                  game_instance + native_layout.kGameInstanceLocalPlayersOffset), players_array) ||
         players_array == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  game_instance + kGameInstanceLocalPlayersOffset + 8), players_count) ||
+                  game_instance + native_layout.kGameInstanceLocalPlayersOffset + 8), players_count) ||
         players_count < 1) {
         return false;
     }
@@ -2296,12 +2476,12 @@ bool GetPlayerController(Context& context) noexcept {
     }
     std::uintptr_t controller{};
     if (!Read(reinterpret_cast<const void*>(
-                  local_player + kLocalPlayerControllerOffset), controller) ||
+                  local_player + native_layout.kLocalPlayerControllerOffset), controller) ||
         controller == 0) {
         return false;
     }
     std::uintptr_t controller_class{};
-    if (!Read(reinterpret_cast<const void*>(controller + kObjectClassOffset),
+    if (!Read(reinterpret_cast<const void*>(controller + native_layout.kObjectClassOffset),
               controller_class) || controller_class == 0) {
         return false;
     }
@@ -2335,12 +2515,12 @@ void BuildClassMap(Context& context) noexcept {
     std::int32_t num_chunks{};
     std::uintptr_t items{};
     if (!Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectItemsOffset), items) ||
+                  context.g_objects_address + native_layout.kObjectItemsOffset), items) ||
         items == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectCountOffset), count) ||
+                  context.g_objects_address + native_layout.kObjectCountOffset), count) ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectNumChunksOffset), num_chunks) ||
+                  context.g_objects_address + native_layout.kObjectNumChunksOffset), num_chunks) ||
         count <= 0 || num_chunks <= 0) {
         return;
     }
@@ -2352,7 +2532,7 @@ void BuildClassMap(Context& context) noexcept {
     std::uint32_t cur_chunk = 0xFFFFFFFFu;
     std::uintptr_t chunk{};
     for (std::int32_t i = 0; i < count; ++i) {
-        const auto chunk_index = static_cast<std::uint32_t>(i) / kObjectChunkSize;
+        const auto chunk_index = static_cast<std::uint32_t>(i) / native_layout.kObjectChunkSize;
         if (chunk_index != cur_chunk) {
             cur_chunk = chunk_index;
             if (!Read(reinterpret_cast<const void*>(
@@ -2361,20 +2541,20 @@ void BuildClassMap(Context& context) noexcept {
                 continue;
             }
         }
-        const auto within = static_cast<std::uint32_t>(i) % kObjectChunkSize;
+        const auto within = static_cast<std::uint32_t>(i) % native_layout.kObjectChunkSize;
         std::uintptr_t object{};
         if (!Read(reinterpret_cast<const void*>(
-                      chunk + static_cast<std::uintptr_t>(within) * kObjectItemStride), object) ||
+                      chunk + static_cast<std::uintptr_t>(within) * native_layout.kObjectItemStride), object) ||
             object == 0) {
             continue;
         }
         std::uintptr_t cls{};
-        if (!Read(reinterpret_cast<const void*>(object + kObjectClassOffset), cls) ||
+        if (!Read(reinterpret_cast<const void*>(object + native_layout.kObjectClassOffset), cls) ||
             cls == 0) {
             continue;
         }
         std::uint32_t name_id{};
-        if (!Read(reinterpret_cast<const void*>(cls + kObjectNameOffset), name_id) ||
+        if (!Read(reinterpret_cast<const void*>(cls + native_layout.kObjectNameOffset), name_id) ||
             name_id == 0) {
             continue;
         }
@@ -2401,7 +2581,7 @@ void BuildClassMap(Context& context) noexcept {
 std::uintptr_t ScanForActor(Context& context, const Point& p,
                            const std::string_view type_prefix) noexcept {
     if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
                             context.g_objects_address)) {
         return 0;
     }
@@ -2409,12 +2589,12 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
     std::int32_t num_chunks{};
     std::uintptr_t items{};
     if (!Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectItemsOffset), items) ||
+                  context.g_objects_address + native_layout.kObjectItemsOffset), items) ||
         items == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectCountOffset), count) ||
+                  context.g_objects_address + native_layout.kObjectCountOffset), count) ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectNumChunksOffset), num_chunks) ||
+                  context.g_objects_address + native_layout.kObjectNumChunksOffset), num_chunks) ||
         count <= 0 || num_chunks <= 0) {
         return 0;
     }
@@ -2430,7 +2610,7 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
     std::uintptr_t best{};
     double best_dist = 1e30;
     for (std::int32_t i = 0; i < count; ++i) {
-        const auto chunk_index = static_cast<std::uint32_t>(i) / kObjectChunkSize;
+        const auto chunk_index = static_cast<std::uint32_t>(i) / native_layout.kObjectChunkSize;
         if (chunk_index != current_chunk_index) {
             current_chunk_index = chunk_index;
             if (!Read(reinterpret_cast<const void*>(
@@ -2439,20 +2619,20 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
                 continue;
             }
         }
-        const auto within = static_cast<std::uint32_t>(i) % kObjectChunkSize;
+        const auto within = static_cast<std::uint32_t>(i) % native_layout.kObjectChunkSize;
         std::uintptr_t object{};
         if (!Read(reinterpret_cast<const void*>(
-                      chunk + static_cast<std::uintptr_t>(within) * kObjectItemStride), object) ||
+                      chunk + static_cast<std::uintptr_t>(within) * native_layout.kObjectItemStride), object) ||
             object == 0) {
             continue;
         }
         std::uintptr_t cls{};
-        if (!Read(reinterpret_cast<const void*>(object + kObjectClassOffset), cls) ||
+        if (!Read(reinterpret_cast<const void*>(object + native_layout.kObjectClassOffset), cls) ||
             cls == 0) {
             continue;
         }
         std::uint32_t cls_name_id{};
-        if (!Read(reinterpret_cast<const void*>(cls + kObjectNameOffset), cls_name_id)) {
+        if (!Read(reinterpret_cast<const void*>(cls + native_layout.kObjectNameOffset), cls_name_id)) {
             continue;
         }
         if (!map_it->second.contains(cls_name_id)) {
@@ -2469,7 +2649,7 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
             map_it->second.insert(cls_name_id);
         }
         std::uintptr_t cdo{};
-        if (Read(reinterpret_cast<const void*>(cls + kUClassDefaultObjectOffset), cdo) &&
+        if (Read(reinterpret_cast<const void*>(cls + native_layout.kUClassDefaultObjectOffset), cdo) &&
             cdo == object) {
             continue;
         }
@@ -2492,14 +2672,14 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
             if (!world_actor_class) continue;
         }
         std::uintptr_t root{};
-        if (!Read(reinterpret_cast<const void*>(object + kActorRootComponentOffset), root) ||
+        if (!Read(reinterpret_cast<const void*>(object + native_layout.kActorRootComponentOffset), root) ||
             root == 0) {
             continue;
         }
         double bx{}, by{}, bz{};
-        if (!Read(reinterpret_cast<const void*>(root + kSceneComponentLocationOffset), bx) ||
-            !Read(reinterpret_cast<const void*>(root + kSceneComponentLocationOffset + 8), by) ||
-            !Read(reinterpret_cast<const void*>(root + kSceneComponentLocationOffset + 16), bz)) {
+        if (!Read(reinterpret_cast<const void*>(root + native_layout.kSceneComponentLocationOffset), bx) ||
+            !Read(reinterpret_cast<const void*>(root + native_layout.kSceneComponentLocationOffset + 8), by) ||
+            !Read(reinterpret_cast<const void*>(root + native_layout.kSceneComponentLocationOffset + 16), bz)) {
             continue;
         }
         const double dx = bx - p.x;
@@ -2712,7 +2892,8 @@ void Begin(Context& context) {
         !HasShopStealthSkill(context)) {
         context.running = false;
         context.status = context.localizer.Text(
-            "status.shop_requires_zankou", "商店偷取需要使用残虹");
+            "status.shop_requires_zankou",
+            "Shop stealing requires the Zankou skill.");
         return;
     }
     context.status = context.localizer.Text("status.started", "Started");
@@ -2746,7 +2927,7 @@ bool ReadInteractChoices(Context& context, const std::uintptr_t actor,
                          std::vector<std::int32_t>& choices) noexcept {
     std::uint8_t params[24]{};
     std::memcpy(params + 0, &controller, sizeof(controller));
-    if (!Invoke(reinterpret_cast<void*>(actor), reinterpret_cast<void*>(fn),
+    if (!Invoke(context, reinterpret_cast<void*>(actor), reinterpret_cast<void*>(fn),
                 params)) {
         return false;
     }
@@ -2759,7 +2940,7 @@ bool ReadInteractChoices(Context& context, const std::uintptr_t actor,
     for (std::int32_t i = 0; i < entries.count; ++i) {
         std::int32_t index{};
         if (!Read(reinterpret_cast<const void*>(
-                      entries.data + static_cast<std::uintptr_t>(i) * 360),
+                      entries.data + static_cast<std::uintptr_t>(i) * native_layout.kInteractEntryStride),
                   index)) {
             return false;
         }
@@ -2774,7 +2955,7 @@ bool CanTryInteract(Context& context, const std::uintptr_t actor,
     std::uint8_t params[13]{};
     std::memcpy(params + 0, &controller, sizeof(controller));
     std::memcpy(params + 8, &index, sizeof(index));
-    if (!Invoke(reinterpret_cast<void*>(actor), reinterpret_cast<void*>(fn),
+    if (!Invoke(context, reinterpret_cast<void*>(actor), reinterpret_cast<void*>(fn),
                 params)) {
         return false;
     }
@@ -2792,7 +2973,7 @@ bool TriggerInteractPickup(Context& context, const std::uintptr_t actor,
         return false;
     }
     std::uintptr_t cls{};
-    if (!Read(reinterpret_cast<const void*>(actor + kObjectClassOffset), cls) ||
+    if (!Read(reinterpret_cast<const void*>(actor + native_layout.kObjectClassOffset), cls) ||
         cls == 0) {
         if (probe != nullptr) probe->reason = "class-read-failed";
         return false;
@@ -2939,7 +3120,9 @@ bool StartShopExitTransfer(Context& context, const Point& target,
     context.shop_exit_ready_at = now + kShopExitRecoverySettle;
     context.teleported = false;
     context.target_actor = 0;
-    context.status = "商店拿取：移到店外恢复隐身";
+    context.status = context.localizer.Text(
+        "status.shop_exit_transfer",
+        "Shop pickup: moving outside the shop to restore stealth");
     LogShop(context, "shop exit transfer attempt=" +
         std::to_string(context.shop_exit_transfer_attempts));
     return true;
@@ -2960,7 +3143,9 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
                 context.shop_stealth_ready = true;
                 context.teleported = false;
                 context.due = now + std::chrono::seconds(1);
-                context.status = "商店拿取：店外隐身成功，返回目标";
+                context.status = context.localizer.Text(
+                    "status.shop_exit_stealth_ok",
+                    "Shop pickup: stealth restored outside, returning to the target");
                 return false;
             }
         }
@@ -2971,7 +3156,9 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
         context.shop_exit_recovery_active = false;
         context.shop_exit_transfer_pending = false;
         context.shop_exit_ready_at = {};
-        context.status = "商店拿取：店外恢复失败，前往固定安全点";
+        context.status = context.localizer.Text(
+            "status.shop_exit_recovery_failed",
+            "Shop pickup: recovery outside failed, heading to the fixed safe point");
     }
     if (context.shop_safe_transfer_pending) {
         double position[3]{};
@@ -2989,7 +3176,9 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
                 context.running = false;
                 context.shop_safe_transfer_pending = false;
                 context.stop_movement_pending = true;
-                context.status = "商店拿取：固定安全点重传次数用尽，已停止";
+                context.status = context.localizer.Text(
+                    "status.shop_safe_exhausted",
+                    "Shop pickup: fixed safe point teleports used up, stopped");
                 context.due = now + std::chrono::seconds(1);
                 return false;
             }
@@ -2998,7 +3187,9 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
                 ++context.shop_safe_transfer_attempts;
                 context.shop_safe_retry_at = now + kShopSafeRetryDelay;
                 context.shop_safe_deadline = now + kShopSafeDeadline;
-                context.status = "商店拿取：安全点未加载，正在重传";
+                context.status = context.localizer.Text(
+                    "status.shop_safe_loading",
+                    "Shop pickup: the safe point is not loaded, teleporting again");
                 LogShop(context, "fixed safe point transfer retry=" + std::to_string(context.shop_safe_transfer_attempts));
             } else {
                 context.shop_safe_retry_at = now + kShopSafeRetryInterval;
@@ -3009,7 +3200,9 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
                 context.running = false;
                 context.shop_safe_transfer_pending = false;
                 context.stop_movement_pending = true;
-                context.status = "商店拿取：固定安全点加载超时，已停止";
+                context.status = context.localizer.Text(
+                    "status.shop_safe_timeout",
+                    "Shop pickup: fixed safe point load timed out, stopped");
             }
             context.due = now + std::chrono::milliseconds(300);
             return false;
@@ -3023,14 +3216,18 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
             context.shop_safe_retry_at = {};
             context.teleported = false;
             context.due = now + std::chrono::seconds(1);
-            context.status = "商店拿取：固定点隐身成功，返回目标";
+            context.status = context.localizer.Text(
+                "status.shop_safe_stealth_ok",
+                "Shop pickup: stealth restored at the fixed point, returning to the target");
             return false;
         }
         if (now >= context.shop_safe_deadline) {
             context.running = false;
             context.shop_safe_transfer_pending = false;
             context.stop_movement_pending = true;
-            context.status = "商店拿取：固定点仍无法开启隐身，已停止";
+            context.status = context.localizer.Text(
+                "status.shop_safe_stealth_failed",
+                "Shop pickup: the fixed point still cannot start stealth, stopped");
         }
         context.due = now + std::chrono::seconds(1);
         return false;
@@ -3044,7 +3241,9 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
     if (!Teleport(context, safe)) {
         context.running = false;
         context.stop_movement_pending = true;
-        context.status = "商店拿取：无法到达固定安全点，已停止";
+        context.status = context.localizer.Text(
+            "status.shop_safe_unreachable",
+            "Shop pickup: cannot reach the fixed safe point, stopped");
         return false;
     }
     context.shop_safe_transfer_pending = true;
@@ -3054,7 +3253,9 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
     context.shop_safe_retry_at = now + kShopSafeRetryDelay;
     context.teleported = false;
     context.target_actor = 0;
-    context.status = "商店拿取：前往固定安全点";
+    context.status = context.localizer.Text(
+        "status.shop_safe_transfer",
+        "Shop pickup: heading to the fixed safe point");
     LogShop(context, "fixed safe point transfer point=" + target.row_name);
     context.due = now + std::chrono::milliseconds(500);
     return false;
@@ -3085,7 +3286,7 @@ enum class ShopTakeResult : std::uint8_t {
 
 bool ShopItemUsesBlueprint(Context& context, std::uintptr_t actor,
                            bool& use_blueprint) {
-    const auto cls = reinterpret_cast<std::uintptr_t>(ReadPointer(reinterpret_cast<void*>(actor + kObjectClassOffset)));
+    const auto cls = reinterpret_cast<std::uintptr_t>(ReadPointer(reinterpret_cast<void*>(actor + native_layout.kObjectClassOffset)));
     if (!cls || !ObjectName(context.names, cls).starts_with("ShopStealGoods_")) return false;
     std::uintptr_t field{};
     std::int32_t offset{};
@@ -3118,23 +3319,23 @@ ShopTakeResult TakeShopItem(Context& context, std::uintptr_t actor,
 bool ReadActorLocation(Context& context, const std::uintptr_t actor,
                        double (&loc)[3]) noexcept {
     std::uintptr_t root{};
-    if (!Read(reinterpret_cast<const void*>(actor + kActorRootComponentOffset),
+    if (!Read(reinterpret_cast<const void*>(actor + native_layout.kActorRootComponentOffset),
               root) ||
         root == 0) {
         return false;
     }
     return Read(reinterpret_cast<const void*>(
-                    root + kSceneComponentLocationOffset), loc[0]) &&
+                    root + native_layout.kSceneComponentLocationOffset), loc[0]) &&
         Read(reinterpret_cast<const void*>(
-                 root + kSceneComponentLocationOffset + 8), loc[1]) &&
+                 root + native_layout.kSceneComponentLocationOffset + 8), loc[1]) &&
         Read(reinterpret_cast<const void*>(
-                 root + kSceneComponentLocationOffset + 16), loc[2]);
+                 root + native_layout.kSceneComponentLocationOffset + 16), loc[2]);
 }
 
 bool IsObjectInGObjects(Context& context, const std::uintptr_t target) noexcept {
     if (target == 0) return false;
     if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
                             context.g_objects_address)) {
         return true;
     }
@@ -3142,19 +3343,19 @@ bool IsObjectInGObjects(Context& context, const std::uintptr_t target) noexcept 
     std::int32_t num_chunks{};
     std::uintptr_t items{};
     if (!Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectItemsOffset), items) ||
+                  context.g_objects_address + native_layout.kObjectItemsOffset), items) ||
         items == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectCountOffset), count) ||
+                  context.g_objects_address + native_layout.kObjectCountOffset), count) ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectNumChunksOffset), num_chunks) ||
+                  context.g_objects_address + native_layout.kObjectNumChunksOffset), num_chunks) ||
         count <= 0 || num_chunks <= 0) {
         return true;
     }
     std::uint32_t cur_chunk = 0xFFFFFFFFu;
     std::uintptr_t chunk{};
     for (std::int32_t i = 0; i < count; ++i) {
-        const auto chunk_index = static_cast<std::uint32_t>(i) / kObjectChunkSize;
+        const auto chunk_index = static_cast<std::uint32_t>(i) / native_layout.kObjectChunkSize;
         if (chunk_index != cur_chunk) {
             cur_chunk = chunk_index;
             if (!Read(reinterpret_cast<const void*>(
@@ -3164,10 +3365,10 @@ bool IsObjectInGObjects(Context& context, const std::uintptr_t target) noexcept 
                 continue;
             }
         }
-        const auto within = static_cast<std::uint32_t>(i) % kObjectChunkSize;
+        const auto within = static_cast<std::uint32_t>(i) % native_layout.kObjectChunkSize;
         std::uintptr_t object{};
         if (!Read(reinterpret_cast<const void*>(
-                      chunk + static_cast<std::uintptr_t>(within) * kObjectItemStride),
+                      chunk + static_cast<std::uintptr_t>(within) * native_layout.kObjectItemStride),
                   object) ||
             object == 0) {
             continue;
@@ -3276,8 +3477,13 @@ void TickPickup(Context& context, const Point& p,
                 ++context.pickup_retries;
                 context.pickup_started = false;
                 context.due = now + std::chrono::milliseconds(1000);
-                context.status = "等待箱子加载 " + p.row_name +
-                    " (" + std::to_string(context.pickup_retries) + ")";
+                const std::string box_retry_str =
+                    std::to_string(context.pickup_retries);
+                const std::array box_load_args{
+                    std::string_view(box_retry_str), std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.waiting_load", "Waiting box load {0} [{1}]",
+                    box_load_args);
                 return;
             }
             if (context.target_actor == 0) {
@@ -3289,15 +3495,15 @@ void TickPickup(Context& context, const Point& p,
                 std::uintptr_t root{};
                 const bool near_point =
                     Read(reinterpret_cast<const void*>(
-                             context.target_actor + kActorRootComponentOffset),
+                             context.target_actor + native_layout.kActorRootComponentOffset),
                          root) &&
                     root != 0 &&
                     Read(reinterpret_cast<const void*>(
-                             root + kSceneComponentLocationOffset), bx) &&
+                             root + native_layout.kSceneComponentLocationOffset), bx) &&
                     Read(reinterpret_cast<const void*>(
-                             root + kSceneComponentLocationOffset + 8), by) &&
+                             root + native_layout.kSceneComponentLocationOffset + 8), by) &&
                     Read(reinterpret_cast<const void*>(
-                             root + kSceneComponentLocationOffset + 16), bz) &&
+                             root + native_layout.kSceneComponentLocationOffset + 16), bz) &&
                     ((bx - p.x) * (bx - p.x) + (by - p.y) * (by - p.y) +
                      (bz - p.z) * (bz - p.z)) <=
                         kFallbackVerifyRadiusCentimeters *
@@ -3388,8 +3594,11 @@ void TickPickup(Context& context, const Point& p,
         context.due = now;
         return;
     }
-    context.status = "拾取中 " + p.row_name + " conf=" +
-        std::to_string(snapshot.confirmed);
+    const std::string confirmed_str = std::to_string(snapshot.confirmed);
+    const std::array confirmed_args{
+        std::string_view(p.row_name), std::string_view(confirmed_str)};
+    context.status = context.localizer.Format(
+        "status.picking_confirmed", "Picking {0} conf={1}", confirmed_args);
     context.due = now + std::chrono::milliseconds(300);
 }
 
@@ -3442,8 +3651,13 @@ void TickFoodPickup(Context& context, const Point& p,
             ++context.retry_count;
             if (context.retry_count <= kActorLoadWaitSeconds) {
                 context.due = now + std::chrono::milliseconds(1000);
-                context.status = "等待加载 " + p.row_name + " (" +
-                    std::to_string(context.retry_count) + ")";
+                const std::string actor_retry_str =
+                    std::to_string(context.retry_count);
+                const std::array actor_load_args{
+                    std::string_view(p.row_name), std::string_view(actor_retry_str)};
+                context.status = context.localizer.Format(
+                    "status.waiting_actor_load", "Waiting load {0} ({1})",
+                    actor_load_args);
             } else if (context.teleport_retry == 0) {
                 std::uintptr_t verify_actor =
                     ScanForActor(context, p, ActorPrefixForCategory(p.category));
@@ -3451,9 +3665,14 @@ void TickFoodPickup(Context& context, const Point& p,
                 context.teleported = false;
                 context.retry_count = 0;
                 context.due = now + std::chrono::milliseconds(2000);
+                const std::array unloaded_args{std::string_view(p.row_name)};
                 context.status = verify_actor == 0
-                    ? "箱子未加载，重传 " + p.row_name
-                    : "重传 " + p.row_name;
+                    ? context.localizer.Format(
+                          "status.box_unloaded_reteleport",
+                          "Box not loaded, re-teleport {0}", unloaded_args)
+                    : context.localizer.Format(
+                          "status.reteleport", "Re-teleport [{0}]",
+                          unloaded_args);
             } else {
                 LogPointTiming(context, p, now, "gave_up");
                 // 空点复核（只对单个食物）：17 秒没等到 actor，先看 500 m 内同区还有没有没捡的
@@ -3481,7 +3700,9 @@ void TickFoodPickup(Context& context, const Point& p,
                 ++context.current_index;
                 ResetPointState(context);
                 context.due = now;
-                context.status = "没找到，跳过 " + p.row_name;
+                const std::array not_found_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.not_found_skip", "Not found, skip {0}", not_found_args);
             }
             return;
         }
@@ -3536,13 +3757,17 @@ void TickFoodPickup(Context& context, const Point& p,
                     context.food_approaching = false;
                     context.food_has_last_pos = false;
                     context.due = now + std::chrono::milliseconds(2000);
-                    context.status = "识别偏离，重传 " + p.row_name;
+                    const std::array drift_reteleport_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.actor_drift_reteleport", "Actor drifted, re-teleport {0}", drift_reteleport_args);
                 } else {
                     ++context.skipped;
                     ++context.current_index;
                     ResetPointState(context);
                     context.due = now;
-                    context.status = "识别偏离，跳过 " + p.row_name;
+                    const std::array drift_skip_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.actor_drift_skip", "Actor drifted, skip {0}", drift_skip_args);
                 }
                 return;
             }
@@ -3558,7 +3783,9 @@ void TickFoodPickup(Context& context, const Point& p,
                     ap.z = actor_pos[2];
                     Teleport(context, ap);
                     context.due = now + std::chrono::milliseconds(1000);
-                    context.status = "靠近中(传送) " + p.row_name;
+                    const std::array approach_teleport_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.approaching_teleport", "Approaching (teleport) {0}", approach_teleport_args);
                     return;
                 }
                 if (NavigationReady(context.navigation)) {
@@ -3606,9 +3833,14 @@ void TickFoodPickup(Context& context, const Point& p,
                         context.food_has_last_pos = false;
                     } else {
                         context.due = now + std::chrono::milliseconds(300);
-                        context.status = "靠近中 " +
-                            std::to_string(static_cast<long long>(dist)) + "cm " +
-                            p.row_name;
+                        const std::string approach_distance =
+                            std::to_string(static_cast<long long>(dist));
+                        const std::array approach_distance_args{
+                            std::string_view(approach_distance),
+                            std::string_view(p.row_name)};
+                        context.status = context.localizer.Format(
+                            "status.approaching_distance",
+                            "Approaching {0}cm {1}", approach_distance_args);
                         return;
                     }
                 } else {
@@ -3625,7 +3857,9 @@ void TickFoodPickup(Context& context, const Point& p,
             ++context.current_index;
             ResetPointState(context);
             context.due = now;
-            context.status = "拾取不可用 " + p.row_name;
+            const std::array pickup_unavailable_args{std::string_view(p.row_name)};
+            context.status = context.localizer.Format(
+                "status.pickup_unavailable_point", "Pickup unavailable {0}", pickup_unavailable_args);
             return;
         }
         {
@@ -3646,14 +3880,18 @@ void TickFoodPickup(Context& context, const Point& p,
                     if (Teleport(context, ap)) {
                         context.due =
                             now + std::chrono::milliseconds(1000);
-                        context.status = "距离过远，传送到物品 " + p.row_name;
+                        const std::array too_far_args{std::string_view(p.row_name)};
+                        context.status = context.localizer.Format(
+                            "status.too_far_teleport", "Too far, teleporting to the item {0}", too_far_args);
                         return;
                     }
                     ++context.skipped;
                     ++context.current_index;
                     ResetPointState(context);
                     context.due = now;
-                    context.status = "距离过远传送失败，跳过 " + p.row_name;
+                    const std::array too_far_failed_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.too_far_skip", "Too far to teleport, skip {0}", too_far_failed_args);
                     return;
                 }
             }
@@ -3666,7 +3904,9 @@ void TickFoodPickup(Context& context, const Point& p,
                 ++context.current_index;
                 ResetPointState(context);
                 context.due = now;
-                context.status = "拾取快照失败 " + p.row_name;
+                const std::array snapshot_failed_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_snapshot_failed", "Pickup snapshot failed [{0}]", snapshot_failed_args);
                 return;
             }
             AnomalyNtePickupRequestV1 request{sizeof(request)};
@@ -3679,7 +3919,9 @@ void TickFoodPickup(Context& context, const Point& p,
                 ++context.current_index;
                 ResetPointState(context);
                 context.due = now;
-                context.status = "拾取请求失败 " + p.row_name;
+                const std::array request_failed_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_request_failed", "Pickup request failed [{0}]", request_failed_args);
                 return;
             }
             context.pickup_baseline_sequence = baseline.sequence;
@@ -3688,7 +3930,9 @@ void TickFoodPickup(Context& context, const Point& p,
                 now + std::chrono::milliseconds(
                           static_cast<long long>(kPickupTimeoutSeconds * 1000.0));
             context.due = now;
-            context.status = "拾取中 " + p.row_name;
+            const std::array picking_args{std::string_view(p.row_name)};
+            context.status = context.localizer.Format(
+                "status.picking", "Picking [{0}]", picking_args);
             return;
         }
         AnomalyNtePickupSnapshotV1 snapshot{sizeof(snapshot)};
@@ -3704,7 +3948,9 @@ void TickFoodPickup(Context& context, const Point& p,
                 ++context.current_index;
                 ResetPointState(context);
                 context.due = now;
-                context.status = "已拾取 " + p.row_name;
+                const std::array picked_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.picked_item", "Picked {0}", picked_args);
                 return;
             }
             if (snapshot.nearby == 0 && snapshot.triggered == 0 &&
@@ -3713,8 +3959,14 @@ void TickFoodPickup(Context& context, const Point& p,
                     ++context.pickup_retries;
                     context.pickup_started = false;
                     context.due = now + std::chrono::milliseconds(1000);
-                    context.status = "等待拾取物 " + p.row_name + " (" +
-                        std::to_string(context.pickup_retries) + ")";
+                    const std::string item_retry_str =
+                        std::to_string(context.pickup_retries);
+                    const std::array item_load_args{
+                        std::string_view(p.row_name),
+                        std::string_view(item_retry_str)};
+                    context.status = context.localizer.Format(
+                        "status.waiting_pickup_item",
+                        "Waiting for pickup {0} ({1})", item_load_args);
                     return;
                 }
                 if (p.category == "prison" && context.target_actor != 0) {
@@ -3724,20 +3976,26 @@ void TickFoodPickup(Context& context, const Point& p,
                             context.interact_verify_deadline =
                                 now + std::chrono::seconds(6);
                             context.due = now + std::chrono::milliseconds(1000);
-                            context.status = "监狱专属交互 " + p.row_name;
+                            const std::array prison_interact_args{std::string_view(p.row_name)};
+                            context.status = context.localizer.Format(
+                                "status.prison_interact", "Prison interaction {0}", prison_interact_args);
                             return;
                         }
                     } else if (now < context.interact_verify_deadline) {
                         TriggerInteractPickup(context, context.target_actor);
                         context.due = now + std::chrono::milliseconds(1000);
-                        context.status = "监狱专属等待 " + p.row_name;
+                        const std::array prison_wait_args{std::string_view(p.row_name)};
+                        context.status = context.localizer.Format(
+                            "status.prison_wait", "Prison wait {0}", prison_wait_args);
                         return;
                     } else {
                         ++context.picked;
                         ++context.current_index;
                         ResetPointState(context);
                         context.due = now;
-                        context.status = "监狱专属拾取 " + p.row_name;
+                        const std::array prison_pickup_args{std::string_view(p.row_name)};
+                        context.status = context.localizer.Format(
+                            "status.prison_pickup", "Prison pickup {0}", prison_pickup_args);
                         return;
                     }
                 }
@@ -3751,21 +4009,27 @@ void TickFoodPickup(Context& context, const Point& p,
                     context.food_approaching = false;
                     context.food_has_last_pos = false;
                     context.due = now + std::chrono::milliseconds(2000);
-                    context.status = "没拾取到，重传 " + p.row_name;
+                    const std::array nothing_reteleport_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.nothing_picked_reteleport", "Nothing picked, re-teleport {0}", nothing_reteleport_args);
                     return;
                 }
                 ++context.skipped;
                 ++context.current_index;
                 ResetPointState(context);
                 context.due = now;
-                context.status = "没拾取到，跳过 " + p.row_name;
+                const std::array nothing_skip_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.nothing_picked_skip", "Nothing picked, skip {0}", nothing_skip_args);
                 return;
             }
             if (context.pickup_retries < kPickupMaximumRetries) {
                 ++context.pickup_retries;
                 context.pickup_started = false;
                 context.due = now + std::chrono::milliseconds(300);
-                context.status = "拾取重试 " + p.row_name;
+                const std::array pickup_retry_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_retry_point", "Pickup retry {0}", pickup_retry_args);
                 return;
             }
             if (context.teleport_retry == 0) {
@@ -3778,14 +4042,18 @@ void TickFoodPickup(Context& context, const Point& p,
                 context.food_approaching = false;
                 context.food_has_last_pos = false;
                 context.due = now + std::chrono::milliseconds(2000);
-                context.status = "拾取失败，重传 " + p.row_name;
+                const std::array pickup_failed_reteleport_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_failed_reteleport", "Pickup failed, re-teleport {0}", pickup_failed_reteleport_args);
                 return;
             }
             ++context.skipped;
             ++context.current_index;
             ResetPointState(context);
             context.due = now;
-            context.status = "拾取失败 " + p.row_name;
+            const std::array pickup_failed_args{std::string_view(p.row_name)};
+            context.status = context.localizer.Format(
+                "status.pickup_failed", "Pickup failed [{0}]", pickup_failed_args);
             return;
         }
         if (now >= context.pickup_deadline) {
@@ -3799,19 +4067,442 @@ void TickFoodPickup(Context& context, const Point& p,
                 context.food_approaching = false;
                 context.food_has_last_pos = false;
                 context.due = now + std::chrono::milliseconds(2000);
-                context.status = "拾取超时，重传 " + p.row_name;
+                const std::array pickup_timeout_reteleport_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_timeout_reteleport", "Pickup timeout, re-teleport {0}", pickup_timeout_reteleport_args);
                 return;
             }
             ++context.skipped;
             ++context.current_index;
             ResetPointState(context);
             context.due = now;
-            context.status = "拾取超时 " + p.row_name;
+            const std::array pickup_timeout_args{std::string_view(p.row_name)};
+            context.status = context.localizer.Format(
+                "status.pickup_timeout", "Pickup timeout [{0}]", pickup_timeout_args);
             return;
         }
         context.due = now + std::chrono::milliseconds(300);
-        context.status = "拾取中 " + p.row_name;
+        const std::array picking_args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format(
+            "status.picking", "Picking [{0}]", picking_args);
     }
+}
+
+// A world safe answers BP_IsTreasureBoxOpened (1 parm, 1 byte through the parameter buffer). That
+// answer is the only trustworthy way to tell a looted safe from a fresh one.
+bool ReadSafeOpened(Context& context, const std::uintptr_t actor, bool& known) noexcept {
+    known = false;
+    std::uintptr_t cls{};
+    if (!Read(reinterpret_cast<const void*>(actor + native_layout.kObjectClassOffset), cls) ||
+        cls == 0) {
+        return false;
+    }
+    std::uintptr_t getter{};
+    if (!FindFunction(context.names, cls, "BP_IsTreasureBoxOpened", 1, 1, getter) ||
+        getter == 0) {
+        return false;
+    }
+    std::uint8_t params[8]{};
+    if (!Invoke(context, reinterpret_cast<void*>(actor), reinterpret_cast<void*>(getter),
+                params)) {
+        return false;
+    }
+    known = true;
+    return params[0] != 0;
+}
+
+// World safes are looted with the game's own client event chain: the pick-lock animation is
+// presentation only, and NetMulticast_NotifyTreasureBoxUnlock is what flips the box to opened.
+// The chain stops at the first event after which BP_IsTreasureBoxOpened answers true.
+void TickSafeBox(Context& context, const Point& p,
+                 const std::chrono::steady_clock::time_point now) {
+    if (context.target_actor == 0) {
+        context.target_actor = ScanForActor(context, p, kSafeActorPrefix);
+        if (context.target_actor == 0) {
+            ++context.retry_count;
+            if (context.retry_count <= kActorLoadWaitSeconds) {
+                context.due = now + std::chrono::milliseconds(1000);
+                const std::array args{std::string_view(p.row_name),
+                                      std::string_view(std::to_string(context.retry_count))};
+                context.status = context.localizer.Format(
+                    "status.safe_wait_actor", "Waiting for safe {0} ({1})", args);
+            } else if (context.teleport_retry == 0) {
+                // A safe only exists once its cell streams in, and the arrival can land in a cell
+                // that is still loading, so one more teleport is worth trying before giving up.
+                context.teleport_retry = 1;
+                context.teleported = false;
+                context.retry_count = 0;
+                context.due = now + std::chrono::milliseconds(2000);
+                const std::array args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.safe_reteleport", "Safe not loaded, re-teleport {0}", args);
+            } else {
+                ++context.skipped;
+                ++context.current_index;
+                ResetPointState(context);
+                context.due = now;
+                const std::array args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.safe_not_found", "Safe not found, skip {0}", args);
+                LogBox(context, "safe not found point=" + p.row_name);
+            }
+            return;
+        }
+    }
+    bool known{};
+    const bool opened = ReadSafeOpened(context, context.target_actor, known);
+    if (known && opened && !context.safe_dispatched) {
+        // Already looted: remember it so every later table read drops the point.
+        context.safe_opened_points.insert(p.row_name);
+        ++context.skipped;
+        ++context.current_index;
+        ResetPointState(context);
+        context.due = now;
+        const std::array args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format(
+            "status.safe_already_open", "Safe already open, skip {0}", args);
+        LogBox(context, "safe already open point=" + p.row_name);
+        return;
+    }
+    if (!context.safe_dispatched) {
+        double actor_pos[3]{};
+        double player_pos[3]{};
+        if (ReadActorLocation(context, context.target_actor, actor_pos) &&
+            SnapshotPlayerPosition(context, player_pos)) {
+            const double dx = player_pos[0] - actor_pos[0];
+            const double dy = player_pos[1] - actor_pos[1];
+            const double dist = std::sqrt(dx * dx + dy * dy);
+            // The event chain does not need the player to stand on the box, so only a safe that is
+            // plainly out of reach is approached, and never at the cost of the dispatch.
+            if (dist > kTargetActorMaxDistanceCentimeters) {
+                const bool developer_mode =
+                    context.developer_mode.load(std::memory_order_acquire);
+                if (developer_mode) {
+                    Point approach;
+                    approach.x = actor_pos[0];
+                    approach.y = actor_pos[1];
+                    approach.z = actor_pos[2];
+                    Teleport(context, approach);
+                    context.due = now + std::chrono::milliseconds(1000);
+                } else if (NavigationReady(context.navigation)) {
+                    Point approach;
+                    approach.x = actor_pos[0];
+                    approach.y = actor_pos[1];
+                    approach.z = player_pos[2];
+                    double destination[3]{};
+                    ComputeApproachDestination(context, approach, destination);
+                    context.navigation->move_to_location(
+                        context.navigation->user, destination);
+                    context.due = now + std::chrono::milliseconds(300);
+                } else {
+                    context.due = now + std::chrono::milliseconds(500);
+                }
+                const std::string distance =
+                    std::to_string(static_cast<long long>(dist));
+                const std::array args{std::string_view(p.row_name),
+                                      std::string_view(distance)};
+                context.status = context.localizer.Format(
+                    "status.safe_approach", "Approaching safe {0} ({1}cm)", args);
+                return;
+            }
+        }
+        std::uintptr_t cls{};
+        Read(reinterpret_cast<const void*>(context.target_actor + native_layout.kObjectClassOffset),
+             cls);
+        std::string used;
+        bool state_known{};
+        bool state_opened{};
+        for (const std::string_view step : kSafeUnlockSteps) {
+            std::uintptr_t function{};
+            if (!FindFunction(context.names, cls, step, 0, 0, function) || function == 0) {
+                continue;
+            }
+            if (!Invoke(context, reinterpret_cast<void*>(context.target_actor),
+                        reinterpret_cast<void*>(function), nullptr)) {
+                continue;
+            }
+            if (!used.empty()) used.push_back('+');
+            used += step;
+            state_opened = ReadSafeOpened(context, context.target_actor, state_known);
+            if (state_known && state_opened) break;
+        }
+        LogBox(context, "safe dispatch point=" + p.row_name + " used=" + used +
+                            " opened=" + (state_known ? (state_opened ? "1" : "0") : "n/a"));
+        if (state_known && state_opened) {
+            context.safe_opened_points.insert(p.row_name);
+            ++context.picked;
+            ++context.current_index;
+            ResetPointState(context);
+            context.due = now;
+            const std::array args{std::string_view(p.row_name), std::string_view(used)};
+            context.status = context.localizer.Format(
+                "status.safe_opened", "Opened safe {0} ({1})", args);
+            return;
+        }
+        context.safe_dispatched = true;
+        context.safe_grace = 0;
+        context.due = now + std::chrono::milliseconds(1500);
+        const std::array args{std::string_view(p.row_name), std::string_view(used)};
+        context.status = context.localizer.Format(
+            "status.safe_dispatched", "Unlock sent to safe {0} ({1})", args);
+        return;
+    }
+    // The box reacts a moment later, so the state is re-read for a few ticks before giving up.
+    bool later_known{};
+    const bool later_opened = ReadSafeOpened(context, context.target_actor, later_known);
+    if (later_known && later_opened) {
+        context.safe_opened_points.insert(p.row_name);
+        ++context.picked;
+        ++context.current_index;
+        ResetPointState(context);
+        context.due = now;
+        const std::array args{std::string_view(p.row_name), std::string_view("verify")};
+        context.status = context.localizer.Format(
+            "status.safe_opened", "Opened safe {0} ({1})", args);
+        LogBox(context, "safe opened point=" + p.row_name + " via=verify");
+        return;
+    }
+    if (later_known && context.safe_grace < 2) {
+        ++context.safe_grace;
+        context.due = now + std::chrono::milliseconds(1200);
+        const std::array args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format(
+            "status.safe_verifying", "Checking safe {0}", args);
+        return;
+    }
+    if (context.teleport_retry == 0) {
+        context.teleport_retry = 1;
+        context.target_actor = 0;
+        context.safe_dispatched = false;
+        context.safe_grace = 0;
+        context.retry_count = 0;
+        context.teleported = false;
+        context.due = now + std::chrono::milliseconds(2000);
+        const std::array args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format(
+            "status.safe_retry", "Safe still closed, retry {0}", args);
+        LogBox(context, "safe retry point=" + p.row_name);
+        return;
+    }
+    ++context.skipped;
+    ++context.current_index;
+    ResetPointState(context);
+    context.due = now;
+    const std::array args{std::string_view(p.row_name)};
+    context.status = context.localizer.Format(
+        "status.safe_failed", "Safe did not open, skip {0}", args);
+    LogBox(context, "safe failed point=" + p.row_name);
+}
+
+
+// A lost key still offering interaction entries has not been taken; one with no entries, or one
+// that left GObjects, has. That difference is the only confirmation available.
+bool ActorOffersInteractEntries(Context& context, const std::uintptr_t actor,
+                                int& entries) noexcept {
+    entries = 0;
+    if (actor == 0 || context.trigger_interact_fn == 0) return false;
+    std::uintptr_t cls{};
+    if (!Read(reinterpret_cast<const void*>(actor + native_layout.kObjectClassOffset), cls) ||
+        cls == 0) {
+        return false;
+    }
+    std::uintptr_t entries_fn{};
+    if (!FindFunction(context.names, cls, "BPGetInteractEntries", 2, 24, entries_fn)) {
+        return false;
+    }
+    std::vector<std::int32_t> choices;
+    if (!ReadInteractChoices(context, actor, context.controller, entries_fn, choices)) {
+        return false;
+    }
+    entries = static_cast<int>(choices.size());
+    return true;
+}
+
+// Keys are plain interactable actors: the interaction entries they expose are what takes the key,
+// and the actor leaving GObjects is the confirmation. Their point is the actor position read during
+// the sweep, which goes stale while the cell streams, so the live position decides the landing.
+void TickLockerKey(Context& context, const Point& p,
+                   const std::chrono::steady_clock::time_point now) {
+    if (context.target_actor == 0) {
+        context.target_actor = ScanForActor(context, p, "CabinetKey");
+        if (context.target_actor == 0) {
+            ++context.retry_count;
+            if (context.retry_count <= kActorLoadWaitSeconds) {
+                context.due = now + std::chrono::milliseconds(500);
+                const std::array args{std::string_view(p.row_name),
+                                      std::string_view(std::to_string(context.retry_count))};
+                context.status = context.localizer.Format(
+                    "status.key_wait_actor", "Waiting for key {0} ({1})", args);
+            } else {
+                ++context.skipped;
+                ++context.current_index;
+                ResetPointState(context);
+                context.due = now;
+                const std::array args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.key_not_found", "Key not found, skip {0}", args);
+            }
+            return;
+        }
+    }
+    double actor_pos[3]{};
+    double player_pos[3]{};
+    const bool located = ReadActorLocation(context, context.target_actor, actor_pos) &&
+        SnapshotPlayerPosition(context, player_pos);
+    // Once the interaction went out the actor may already be tearing down and its components read
+    // as the origin; treating that as a distance would send the player across the map.
+    if (!located && !context.interacted) {
+        ++context.retry_count;
+        context.target_actor = 0;
+        if (context.retry_count > kActorLoadWaitSeconds) {
+            ++context.skipped;
+            ++context.current_index;
+            ResetPointState(context);
+            context.due = now;
+            const std::array args{std::string_view(p.row_name)};
+            context.status = context.localizer.Format(
+                "status.key_unreachable", "Key position unreachable, skip {0}", args);
+            LogBox(context, "key location lost point=" + p.row_name);
+            return;
+        }
+        context.due = now + std::chrono::milliseconds(500);
+        return;
+    }
+    const bool developer_mode = context.developer_mode.load(std::memory_order_acquire);
+    const double approach_threshold =
+        developer_mode ? kTeleportApproachRadiusCentimeters : kPickupApproachRadiusCentimeters;
+    if (!context.interacted && located) {
+        const double dx = player_pos[0] - actor_pos[0];
+        const double dy = player_pos[1] - actor_pos[1];
+        const double dz = player_pos[2] - actor_pos[2];
+        const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist > approach_threshold) {
+            if (std::abs(actor_pos[0]) < 1.0 && std::abs(actor_pos[1]) < 1.0) {
+                ++context.retry_count;
+                context.target_actor = 0;
+                if (context.retry_count > kActorLoadWaitSeconds) {
+                    ++context.skipped;
+                    ++context.current_index;
+                    ResetPointState(context);
+                    context.due = now;
+                    const std::array args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.key_unreachable", "Key position unreachable, skip {0}", args);
+                    LogBox(context, "key position zero point=" + p.row_name);
+                } else {
+                    context.due = now + std::chrono::milliseconds(500);
+                }
+                return;
+            }
+            Point approach;
+            approach.x = actor_pos[0];
+            approach.y = actor_pos[1];
+            approach.z = actor_pos[2];
+            if (developer_mode) {
+                if (context.interact_retry >= 3) {
+                    ++context.skipped;
+                    ++context.current_index;
+                    ResetPointState(context);
+                    context.due = now;
+                    const std::array args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.key_unreachable", "Key position unreachable, skip {0}", args);
+                    LogBox(context, "key teleport gave up point=" + p.row_name + " cm=" +
+                                        std::to_string(static_cast<long long>(dist)));
+                    return;
+                }
+                ++context.interact_retry;
+                Teleport(context, approach);
+                context.due = now + std::chrono::milliseconds(1000);
+            } else if (NavigationReady(context.navigation)) {
+                double destination[3]{};
+                ComputeApproachDestination(context, approach, destination);
+                context.navigation->move_to_location(context.navigation->user, destination);
+                context.due = now + std::chrono::milliseconds(300);
+            } else {
+                context.due = now + std::chrono::milliseconds(500);
+            }
+            const std::array args{
+                std::string_view(p.row_name),
+                std::string_view(std::to_string(static_cast<long long>(dist)))};
+            context.status = context.localizer.Format(
+                "status.key_approach", "Approaching key {0} ({1}cm)", args);
+            return;
+        }
+    }
+    if (!context.interacted) {
+        InteractProbe probe{};
+        const bool fired = TriggerInteractPickup(context, context.target_actor, &probe);
+        context.interacted = true;
+        context.key_fired = fired;
+        context.due = now + std::chrono::milliseconds(2000);
+        const std::string entries = std::to_string(probe.entries);
+        const std::string fired_text = fired ? "1" : "0";
+        const std::array args{std::string_view(p.row_name), std::string_view(entries),
+                              std::string_view(fired_text)};
+        context.status = context.localizer.Format(
+            "status.key_interact", "Interacting with key {0} (entries {1}, fired {2})", args);
+        LogBox(context, "key interact point=" + p.row_name + " entries=" + entries +
+                            " fired=" + fired_text + " reason=" + std::string(probe.reason));
+        if (!fired && probe.entries == 0) {
+            // No entries at all means the key was already taken; the point is finished.
+            ++context.picked;
+            ++context.current_index;
+            ResetPointState(context);
+            context.due = now;
+            const std::array gone_args{std::string_view(p.row_name)};
+            context.status = context.localizer.Format(
+                "status.key_already", "Key already taken {0}", gone_args);
+            LogBox(context, "key already taken point=" + p.row_name);
+        }
+        return;
+    }
+    int live_entries{};
+    const bool entries_readable =
+        ActorOffersInteractEntries(context, context.target_actor, live_entries);
+    if (!IsObjectInGObjects(context, context.target_actor) ||
+        (entries_readable && live_entries == 0)) {
+        ++context.picked;
+        ++context.current_index;
+        ResetPointState(context);
+        context.due = now;
+        const std::array args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format("status.key_picked", "Key picked {0}", args);
+        LogBox(context, "key picked point=" + p.row_name +
+                            (entries_readable ? " via=entries" : " via=gone"));
+        return;
+    }
+    // The key plays its collection animation for a moment before it disappears, so it gets a
+    // couple of grace ticks before the attempt counts as failed.
+    if (context.key_fired && context.key_grace < 3) {
+        ++context.key_grace;
+        context.due = now + std::chrono::milliseconds(1500);
+        const std::array args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format("status.key_verifying", "Checking key {0}", args);
+        return;
+    }
+    if (context.teleport_retry == 0) {
+        context.teleport_retry = 1;
+        context.target_actor = 0;
+        context.interacted = false;
+        context.key_fired = false;
+        context.key_grace = 0;
+        context.retry_count = 0;
+        context.teleported = false;
+        context.due = now + std::chrono::milliseconds(2000);
+        const std::array args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format(
+            "status.key_reattempt", "Key remained, re-approach {0}", args);
+        return;
+    }
+    ++context.skipped;
+    ++context.current_index;
+    ResetPointState(context);
+    context.due = now;
+    const std::array args{std::string_view(p.row_name)};
+    context.status = context.localizer.Format(
+        "status.key_remained_skip", "Key remained, skip {0}", args);
+    LogBox(context, "key remained skip point=" + p.row_name);
 }
 
 void Tick(Context& context) {
@@ -3926,7 +4617,10 @@ void Tick(Context& context) {
         PrepareShopStealth(context, p, now);
         return;
     }
-    if (!context.teleported && !context.moving && !context.landmark_transfer_wait) {
+    // A key's point is the actor position read during the sweep and goes stale while its cell
+    // streams, so TickLockerKey decides the landing from the live position instead.
+    if (!context.teleported && !context.moving && !context.landmark_transfer_wait &&
+        p.category != "locker_key") {
         if (context.developer_mode.load(std::memory_order_acquire)) {
             if (Teleport(context, p)) {
                 context.teleported = true;
@@ -4129,6 +4823,14 @@ void Tick(Context& context) {
         TickFoodPickup(context, p, now);
         return;
     }
+    if (p.category == "safe") {
+        TickSafeBox(context, p, now);
+        return;
+    }
+    if (p.category == "locker_key") {
+        TickLockerKey(context, p, now);
+        return;
+    }
     if (context.target_actor == 0) {
         double player_pos[3]{};
         if (SnapshotPlayerPosition(context, player_pos) &&
@@ -4217,13 +4919,17 @@ void Tick(Context& context) {
                     context.food_approaching = false;
                     context.food_has_last_pos = false;
                     context.due = now + std::chrono::milliseconds(2000);
-                    context.status = "识别偏离，重传 " + p.row_name;
+                    const std::array drift_reteleport_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.actor_drift_reteleport", "Actor drifted, re-teleport {0}", drift_reteleport_args);
                 } else {
                     ++context.skipped;
                     ++context.current_index;
                     ResetPointState(context);
                     context.due = now;
-                    context.status = "识别偏离，跳过 " + p.row_name;
+                    const std::array drift_skip_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.actor_drift_skip", "Actor drifted, skip {0}", drift_skip_args);
                 }
                 return;
             }
@@ -4239,7 +4945,9 @@ void Tick(Context& context) {
                     ap.z = actor_pos[2];
                     Teleport(context, ap);
                     context.due = now + std::chrono::milliseconds(1000);
-                    context.status = "靠近中(传送) " + p.row_name;
+                    const std::array approach_teleport_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.approaching_teleport", "Approaching (teleport) {0}", approach_teleport_args);
                     return;
                 }
                 if (NavigationReady(context.navigation)) {
@@ -4270,9 +4978,14 @@ void Tick(Context& context) {
                             context.navigation->user, dest);
                     }
                     context.due = now + std::chrono::milliseconds(300);
-                    context.status = "靠近中 " +
-                        std::to_string(static_cast<long long>(dist)) + "cm " +
-                        p.row_name;
+                    const std::string approach_distance =
+                        std::to_string(static_cast<long long>(dist));
+                    const std::array approach_distance_args{
+                        std::string_view(approach_distance),
+                        std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.approaching_distance",
+                        "Approaching {0}cm {1}", approach_distance_args);
                     return;
                 }
                 context.due = now + std::chrono::milliseconds(500);
@@ -4294,7 +5007,7 @@ void Tick(Context& context) {
             ? (shop_result = TakeShopItem(context, context.target_actor,
                                           &shop_probe),
                shop_result == ShopTakeResult::triggered)
-            : Invoke(reinterpret_cast<void*>(context.controller),
+            : Invoke(context, reinterpret_cast<void*>(context.controller),
                      reinterpret_cast<void*>(context.server_interact_fn), params);
         if (triggered) {
             context.interacted = true;
@@ -4362,7 +5075,7 @@ void Tick(Context& context) {
                         context.due = now + std::chrono::milliseconds(500);
                         context.status = context.localizer.Text(
                             "status.shop_interact_retry",
-                            "隐身有效，等待拾取入口重试");
+                            "Stealth active, waiting for the pickup entry to retry");
                         return;
                     }
                     if (ShopRescanBudgetSpent(context)) {
@@ -4385,7 +5098,7 @@ void Tick(Context& context) {
                     context.due = now + std::chrono::milliseconds(700);
                     context.status = context.localizer.Text(
                         "status.shop_interact_rescan",
-                        "隐身有效，重新扫描拾取目标");
+                        "Stealth active, rescanning the pickup target");
                     return;
                 }
                 if (context.shop_take_retries >= 2) {
@@ -4393,7 +5106,9 @@ void Tick(Context& context) {
                     ++context.current_index;
                     ResetPointState(context);
                     context.due = now;
-                    context.status = "商店拿取失败，跳过 " + p.row_name;
+                    const std::array shop_take_failed_args{std::string_view(p.row_name)};
+                    context.status = context.localizer.Format(
+                        "status.shop_take_failed", "Shop pickup failed, skip {0}", shop_take_failed_args);
                     return;
                 }
                 ++context.shop_take_retries;
@@ -4431,7 +5146,9 @@ void Tick(Context& context) {
                 context.food_approaching = false;
                 context.food_has_last_pos = false;
                 context.due = now + std::chrono::milliseconds(2000);
-                context.status = "交互失败，重传 " + p.row_name;
+                const std::array interact_reteleport_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.interact_failed_reteleport", "Interact failed, re-teleport {0}", interact_reteleport_args);
             } else {
                 const std::array interact_failed_args{std::string_view(p.row_name)};
                 context.status = context.localizer.Format(
@@ -4493,7 +5210,7 @@ void Tick(Context& context) {
                 context.due = now + std::chrono::milliseconds(700);
                 context.status = context.localizer.Text(
                     "status.shop_stealth_wait",
-                    "隐身仍有效，重新扫描拾取目标");
+                    "Stealth still active, rescanning the pickup target");
                 return;
             }
             if (context.shop_take_retries < 2) {
@@ -4583,13 +5300,17 @@ void Tick(Context& context) {
                 context.interact_retry = 0;
                 context.can_interact_retries = 0;
                 context.due = now + std::chrono::milliseconds(2000);
-                context.status = "拾取未确认，重传 " + p.row_name;
+                const std::array unconfirmed_reteleport_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_unconfirmed_reteleport", "Pickup unconfirmed, re-teleport {0}", unconfirmed_reteleport_args);
             } else {
                 ++context.skipped;
                 ++context.current_index;
                 ResetPointState(context);
                 context.due = now;
-                context.status = "拾取未确认，跳过 " + p.row_name;
+                const std::array unconfirmed_skip_args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_unconfirmed_skip", "Pickup unconfirmed, skip {0}", unconfirmed_skip_args);
             }
         } else {
             ++context.picked;
@@ -4604,14 +5325,16 @@ void Tick(Context& context) {
 }
 
 AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** plugin_context) {
+    if (!box_auto_compat::LoadCompatibility(host)) return {ANOMALY_STATUS_V1_UNAVAILABLE,0,{}};
     if (!host || !plugin_context || host->api_major != ANOMALY_PLUGIN_API_V1_MAJOR) {
         return {ANOMALY_STATUS_V1_INVALID_ARGUMENT, 0, {nullptr, 0}};
     }
     auto* context = new (std::nothrow) Context{};
     if (!context) return {ANOMALY_STATUS_V1_FAILED, 0, {nullptr, 0}};
     context->host = host;
+    context->core = anomaly::sdk::Host(host).Query<AnomalyCoreServiceV1>(ANOMALY_CORE_SERVICE_V1_ID).get();
     const auto view = anomaly::sdk::Host(host);
-    context->localizer = anomaly::plugins::Localizer(host);
+    context->localizer = anomaly::sdk::Localizer(host);
     context->signature = view.Query<AnomalySignatureServiceV1>(
         ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION).get();
     context->names = view.Query<AnomalyUe5NamesServiceV1>(
@@ -4770,8 +5493,11 @@ void ANOMALY_CALL Update(void* plugin_context, const double delta_seconds) {
                 context.manual_landmark_target[2] = p.z;
                 context.manual_landmark_pending = true;
                 std::lock_guard<std::mutex> lock(context.mutex);
-                context.status = context.localizer.Text(
-                    "status.landmark_transfer", "Fast travel");
+                const std::array manual_landmark_args{
+                    std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.landmark_transfer", "Fast travel [{0}]",
+                    manual_landmark_args);
             } else {
                 context.manual_landmark_target[0] = p.x;
                 context.manual_landmark_target[1] = p.y;
@@ -4941,7 +5667,7 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     if (ui->button(ui->user, anomaly::sdk::StringView(read_table_label), 0.0F, 0.0F) != 0) {
         context.read_pending.store(true, std::memory_order_release);
     }
-    const std::array<std::string, 12> type_names = {
+    const std::array<std::string, 14> type_names = {
         context.localizer.Text("type.all", "All"),
         context.localizer.Text("type.hunter", "Hunter Box"),
         context.localizer.Text("type.character", "Character Box"),
@@ -4951,9 +5677,11 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
         context.localizer.Text("type.box_food", "Food Box"),
         context.localizer.Text("type.item_food", "Single Food"),
         context.localizer.Text("type.prison", "Prison Resource"),
-        context.localizer.Text("type.wallet", "钱包"),
-        context.localizer.Text("type.oracle", "乌鸦石头"),
+        context.localizer.Text("type.wallet", "Wallet"),
+        context.localizer.Text("type.oracle", "Oracle Stone"),
         context.localizer.Text("type.shop_steal", "Shop Items"),
+        context.localizer.Text("type.safe", "Safe"),
+        context.localizer.Text("type.locker_key", "Lost Locker Key"),
     };
     for (std::size_t i = 0; i < type_names.size(); ++i) {
         if (ui->button(ui->user, anomaly::sdk::StringView(type_names[i]), 0.0F, 0.0F) != 0) {
@@ -4985,7 +5713,8 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     }
     if (type_choice == 11) {
         const std::string requirement = context.localizer.Text(
-            "status.shop_requires_zankou", "商店偷取需要使用残虹");
+            "status.shop_requires_zankou",
+            "Shop stealing requires the Zankou skill.");
         ui->text(ui->user, anomaly::sdk::StringView(requirement));
     }
     // 最近距离拾取：只在单个食物下显示。打开后点位按「区域内就近」重排，下面列表的顺序
@@ -5112,7 +5841,9 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
         const std::string total_str = std::to_string(oracle_total);
         const std::array total_args{std::string_view(total_str)};
         ui->text(ui->user, anomaly::sdk::StringView(context.localizer.Format(
-            "oracle.teleport_points", "乌鸦石头传送点 共 {0} 个（只能手动传送）", total_args)));
+            "oracle.teleport_points",
+            "Oracle stone teleport points: {0} in total (manual teleport only)",
+            total_args)));
     } else {
         std::string status;
         std::size_t total{};
@@ -5200,7 +5931,7 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
     }
     *descriptor = {
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
-        anomaly::sdk::StringView("anomaly.local.box-auto"),
+        anomaly::sdk::StringView("ccyellowstar.box-auto"),
         anomaly::sdk::StringView("Resource Auto Pickup"),
         anomaly::sdk::StringView("CCYellowStar"),
         anomaly::sdk::StringView("0.3.7"), Load, Start, Stop, Unload, Update, Draw};

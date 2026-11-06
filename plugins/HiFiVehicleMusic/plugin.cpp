@@ -7,7 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "plugins/common/localization.hpp"
+#include "anomaly/sdk/localization.hpp"
 #include "plugins/HiFiVehicleMusic/audio_engine.hpp"
 #include "plugins/HiFiVehicleMusic/hifi_vehicle_music_profile.hpp"
 
@@ -89,8 +89,8 @@ constexpr std::array<std::pair<std::string_view, std::string_view>, 3> kDsdModeL
     {"dsd.dop_native_pcm", "DoP > Native > PCM"},
 }};
 
-// Hooks before kCoreHookCount are required for the takeover; the album hooks
-// after it add the library to the in-game music list and are all-or-nothing.
+// Hooks before kCoreHookCount carry the takeover; the album hooks after it add
+// the library to the in-game music list and are all-or-nothing.
 //
 // The stop path drains every hook with the host stop deadline (1s) as its only
 // bound, so a detour that can outlive that budget -- a table walk, a row
@@ -108,6 +108,14 @@ enum HookIndex : std::size_t {
     kPageCover, kItemSelected, kRowClick, kListClick, kSetCurrentIdHook, kDuration2,
     kHookCount
 };
+
+// The takeover cannot run without these: they post, stop, pause and finish the
+// vehicle music, and the down-vehicle signal is the only stop path a taken-over
+// song has. kSetPlayerType only notices a switch away from vehicle music, so a
+// game build whose prologue changed costs that one signal instead of the plugin.
+constexpr bool RequiredHook(const std::size_t index) noexcept {
+    return index < kCoreHookCount && index != kSetPlayerType;
+}
 
 using PostFn = std::int64_t(__fastcall*)(void*, void*, void*, float);
 // Also EndGetOffVehicle(this, bool).
@@ -237,10 +245,23 @@ struct Settings final {
     std::string meting_query;  // the keyword, or the playlist id
 };
 
+struct PlaybackLayout {
+    std::uint32_t playing_id{};
+    std::uint32_t paused{};
+    std::uint32_t player_type{};
+};
+
+struct AlbumLayout {
+    std::uint32_t current_id{};
+    std::uint32_t owned_ids{};
+};
+
 struct Context final {
     const AnomalyCoreServiceV1* core{};
     const AnomalyConfigServiceV1* config{};
-    const AnomalySignatureServiceV1* signature{};
+    const AnomalySignatureServiceV2* signature{};
+    PlaybackLayout layout;
+    std::optional<AlbumLayout> album_layout;
     const AnomalyHookServiceV1* hook{};
     const AnomalyUiServiceV1* ui{};
     const AnomalyUe5NamesServiceV1* names{};
@@ -252,7 +273,7 @@ struct Context final {
     // Kept so the AHUD service can be looked up again: it is published only after
     // the game's reflection gate opens, which is after a boot-time load.
     const AnomalyHostApiV1* host{};
-    anomaly::plugins::Localizer localizer;
+    anomaly::sdk::Localizer localizer;
     AnomalyGenerationHandleV1 settings_schema{};
     AudioEngine engine;
 
@@ -434,8 +455,9 @@ bool CoreReady(const AnomalyCoreServiceV1* service) noexcept {
     return HIFI_HAS(AnomalyCoreServiceV1, read_memory);
 }
 
-bool SignatureReady(const AnomalySignatureServiceV1* service) noexcept {
-    return HIFI_HAS(AnomalySignatureServiceV1, resolve);
+bool SignatureReady(const AnomalySignatureServiceV2* service) noexcept {
+    return HIFI_HAS(AnomalySignatureServiceV2, resolve) &&
+        HIFI_HAS(AnomalySignatureServiceV2, resolve_layout);
 }
 
 bool HookReady(const AnomalyHookServiceV1* service) noexcept {
@@ -813,8 +835,8 @@ bool TakeOverPost(Context& context, void* self, void* event, void* list_id,
         std::uint8_t player_type{};
         std::uint32_t name_id{};
         if (event == nullptr ||
-            !ReadValue(context, subsystem + profile::kSubsystemPlayerTypeOffset, player_type) ||
-            !ReadValue(context, reinterpret_cast<std::uintptr_t>(event) + profile::kObjectNameOffset,
+            !ReadValue(context, subsystem + context.layout.player_type, player_type) ||
+            !ReadValue(context, reinterpret_cast<std::uintptr_t>(event) + profile::Layout.kObjectNameOffset,
                 name_id)) {
             context.engine.Stop();
             return false;
@@ -916,18 +938,18 @@ void NotifyEngine(void (AudioEngine::*action)()) noexcept {
     }
 }
 
-void WritePlayingId(void* subsystem, const std::uint32_t id) noexcept {
+void WritePlayingId(const Context& context, void* subsystem, const std::uint32_t id) noexcept {
     __try {
         *reinterpret_cast<volatile std::uint32_t*>(
-            static_cast<std::byte*>(subsystem) + profile::kSubsystemPlayingIdOffset) = id;
+            static_cast<std::byte*>(subsystem) + context.layout.playing_id) = id;
     } __except (1) {
     }
 }
 
-void WritePausedFlag(void* subsystem, const std::uint8_t paused) noexcept {
+void WritePausedFlag(const Context& context, void* subsystem, const std::uint8_t paused) noexcept {
     __try {
         *reinterpret_cast<volatile std::uint8_t*>(
-            static_cast<std::byte*>(subsystem) + profile::kSubsystemPausedOffset) = paused;
+            static_cast<std::byte*>(subsystem) + context.layout.paused) = paused;
     } __except (1) {
     }
 }
@@ -965,11 +987,11 @@ std::int64_t __fastcall PostDetour(void* self, void* event, void* list_id, const
         CallUnderLease(kStop, [self](const std::uintptr_t stop) { CallStop(stop, self, 0); });
         // The player UI shows progress only for a non-zero PlayingID; the
         // position detours answer this one from the engine.
-        WritePlayingId(self, profile::kPlayingId);
+        WritePlayingId(*context, self, profile::kPlayingId);
         // The skipped Post would also have cleared the Paused flag. Left set
         // (e.g. after resuming through a repost) the next pause click is taken
         // for a resume and seems to do nothing.
-        WritePausedFlag(self, 0);
+        WritePausedFlag(*context, self, 0);
         // The Stop above broadcast the paused state; the replaced Post would
         // have broadcast the resume, so panels following the delegate would
         // disagree with the flag. Replay the resume through the original.
@@ -1049,11 +1071,11 @@ bool IsLocalPlayerCharacter(const Context& context, void* character) noexcept {
     // must point back at the same controller.
     return character != nullptr &&
         ReadValue(context, reinterpret_cast<std::uintptr_t>(character) +
-            profile::kPawnControllerOffset, controller) &&
+            profile::Layout.kPawnControllerOffset, controller) &&
         controller != 0 &&
-        ReadValue(context, controller + profile::kPlayerControllerPlayerOffset, player) &&
+        ReadValue(context, controller + profile::Layout.kPlayerControllerPlayerOffset, player) &&
         player != 0 &&
-        ReadValue(context, player + profile::kPlayerPlayerControllerOffset, owner) &&
+        ReadValue(context, player + profile::Layout.kPlayerPlayerControllerOffset, owner) &&
         owner == controller;
 }
 
@@ -1220,7 +1242,7 @@ bool MakeText(void* destination, const wchar_t* text) noexcept {
     __try {
         alignas(16) std::byte buffer[0x20]{};
         reinterpret_cast<FTextFromStringFn>(from_string)(buffer, text);
-        std::memcpy(destination, buffer, profile::kFTextSize);
+        std::memcpy(destination, buffer, profile::Layout.kFTextSize);
         return true;
     } __except (1) {
         return false;
@@ -1270,14 +1292,14 @@ void* ObjectItem(const Context& context, const std::int32_t index) noexcept {
     std::int32_t count{};
     std::uintptr_t chunk{};
     if (objects == 0 || index < 0 || !ReadValue(context, objects, chunks) ||
-        !ReadValue(context, objects + profile::kObjectArrayCountOffset, count) || index >= count ||
-        !ReadValue(context, chunks + sizeof(std::uintptr_t) * (index / profile::kObjectsPerChunk),
+        !ReadValue(context, objects + profile::Layout.kObjectArrayCountOffset, count) || index >= count ||
+        !ReadValue(context, chunks + sizeof(std::uintptr_t) * (index / profile::Layout.kObjectsPerChunk),
             chunk) ||
         chunk == 0) {
         return nullptr;
     }
     return reinterpret_cast<void*>(
-        chunk + std::uintptr_t{profile::kObjectItemSize} * (index % profile::kObjectsPerChunk));
+        chunk + std::uintptr_t{profile::Layout.kObjectItemSize} * (index % profile::Layout.kObjectsPerChunk));
 }
 
 // The object's weak-pointer serial number, allocated the way the engine's
@@ -1287,7 +1309,7 @@ std::int32_t ObjectSerial(const Context& context, const std::int32_t index) noex
     const std::uintptr_t counter = g_serial_counter.load(std::memory_order_acquire);
     if (item == nullptr || counter == 0) return 0;
     __try {
-        auto* const slot = reinterpret_cast<volatile LONG*>(item + profile::kObjectItemSerialOffset);
+        auto* const slot = reinterpret_cast<volatile LONG*>(item + profile::Layout.kObjectItemSerialOffset);
         LONG serial = *slot;
         if (serial != 0) return serial;
         serial = InterlockedIncrement(reinterpret_cast<volatile LONG*>(counter));
@@ -1328,7 +1350,7 @@ void* ImportCoverTexture(Context& context, AlbumBuild& build) {
     void* const texture = CallImportTexture(path);
     std::int32_t index{};
     if (texture == nullptr ||
-        !ReadValue(context, reinterpret_cast<std::uintptr_t>(texture) + profile::kObjectIndexOffset, index) ||
+        !ReadValue(context, reinterpret_cast<std::uintptr_t>(texture) + profile::Layout.kObjectIndexOffset, index) ||
         !CallSetItemFlags(ObjectItem(context, index), static_cast<std::int32_t>(profile::kRootSetFlag))) {
         Log(context, ANOMALY_CORE_LOG_LEVEL_V1_WARNING, "album cover could not be imported");
         return nullptr;
@@ -1344,7 +1366,7 @@ void SetImageTexture(void* image, void* texture) noexcept {
     __try {
         const auto vtable = *static_cast<std::uintptr_t* const*>(image);
         reinterpret_cast<SetBrushFromTextureFn>(
-            vtable[profile::kImageSetBrushFromTextureSlot / sizeof(std::uintptr_t)])(image, texture, 0);
+            vtable[profile::Layout.kImageSetBrushFromTextureSlot / sizeof(std::uintptr_t)])(image, texture, 0);
     } __except (1) {
     }
 }
@@ -1389,7 +1411,7 @@ void* ImportMetingCover(Context& context, AlbumBuild& build) {
     void* const texture = CallImportTexture(path);
     std::int32_t index{};
     if (texture == nullptr ||
-        !ReadValue(context, reinterpret_cast<std::uintptr_t>(texture) + profile::kObjectIndexOffset, index) ||
+        !ReadValue(context, reinterpret_cast<std::uintptr_t>(texture) + profile::Layout.kObjectIndexOffset, index) ||
         !CallSetItemFlags(ObjectItem(context, index), static_cast<std::int32_t>(profile::kRootSetFlag))) {
         Log(context, ANOMALY_CORE_LOG_LEVEL_V1_WARNING, "Meting cover could not be imported");
         return nullptr;
@@ -1457,11 +1479,11 @@ void RefreshTables(const Context& context) {
     if (game_instance == nullptr) return;
     std::uintptr_t table{};
     if (ReadValue(context, reinterpret_cast<std::uintptr_t>(game_instance) +
-            profile::kGameInstanceMusicTableOffset, table)) {
+            profile::Layout.kGameInstanceMusicTableOffset, table)) {
         g_music_table.store(table, std::memory_order_release);
     }
     if (ReadValue(context, reinterpret_cast<std::uintptr_t>(game_instance) +
-            profile::kGameInstanceAlbumTableOffset, table)) {
+            profile::Layout.kGameInstanceAlbumTableOffset, table)) {
         g_album_table.store(table, std::memory_order_release);
     }
 }
@@ -1509,31 +1531,31 @@ void BuildAlbumSnapshot(Context& context) {
         if (!titles.empty()) {
             std::vector<std::byte*> songs;
             songs.reserve(titles.size());
-            const std::array<std::byte, profile::kFStringSize> empty_string{};
+            const std::vector<std::byte> empty_string(profile::Layout.kFStringSize);
             for (std::size_t i = 0; i < titles.size(); ++i) {
                 if (context.builder_stopping.load(std::memory_order_acquire)) return;
-                std::byte* const row = NewRow(music_template, profile::kMusicRowSize);
+                std::byte* const row = NewRow(music_template, profile::Layout.kMusicRowSize);
                 if (row == nullptr ||
-                    !MakeText(row + profile::kMusicTitleOffset, titles[i].c_str()) ||
-                    !MakeText(row + profile::kMusicDescriptionOffset, L"")) {
+                    !MakeText(row + profile::Layout.kMusicTitleOffset, titles[i].c_str()) ||
+                    !MakeText(row + profile::Layout.kMusicDescriptionOffset, L"")) {
                     // The template no longer reads; a later capture rebuilds.
                     InvalidateMusicTemplate();
                     build.rows_valid = false;
                     return;  // the partial row leaks like a replaced one
                 }
-                Put(row, profile::kMusicSortIndexOffset,
+                Put(row, profile::Layout.kMusicSortIndexOffset,
                     profile::kSortIndexBase + static_cast<std::int32_t>(i));
-                std::memcpy(row + profile::kMusicCommentOffset, empty_string.data(),
+                std::memcpy(row + profile::Layout.kMusicCommentOffset, empty_string.data(),
                     empty_string.size());
-                Put(row, profile::kMusicAlbumIdOffset, AlbumId(base));
+                Put(row, profile::Layout.kMusicAlbumIdOffset, AlbumId(base));
                 // The event keeps the template's asset (song end posts it) but
                 // owns no string buffer of the template.
-                std::memcpy(row + profile::kMusicEventOffset + profile::kMusicEventSubPathOffset,
+                std::memcpy(row + profile::Layout.kMusicEventOffset + profile::Layout.kMusicEventSubPathOffset,
                     empty_string.data(), empty_string.size());
-                Put(row, profile::kMusicSourceItemOffset, std::uint64_t{0});
-                Put(row, profile::kMusicSourceQuestOffset, std::uint64_t{0});
-                Put(row, profile::kMusicIsListOffset, std::uint8_t{1});
-                Put(row, profile::kMusicIsHiddenOffset, std::uint8_t{0});
+                Put(row, profile::Layout.kMusicSourceItemOffset, std::uint64_t{0});
+                Put(row, profile::Layout.kMusicSourceQuestOffset, std::uint64_t{0});
+                Put(row, profile::Layout.kMusicIsListOffset, std::uint8_t{1});
+                Put(row, profile::Layout.kMusicIsHiddenOffset, std::uint8_t{0});
                 songs.push_back(row);
             }
             // The song ids name the base the rows were built for; rows built
@@ -1553,13 +1575,13 @@ void BuildAlbumSnapshot(Context& context) {
     const std::wstring name = context.engine.LibraryName();
     if ((build.album == nullptr || name != build.album_name) && album_template != nullptr &&
         !name.empty()) {
-        std::byte* const row = NewRow(album_template, profile::kAlbumRowSize);
-        if (row == nullptr || !MakeText(row + profile::kAlbumNameOffset, name.c_str()) ||
-            !MakeText(row + profile::kAlbumDescriptionOffset, L"")) {
+        std::byte* const row = NewRow(album_template, profile::Layout.kAlbumRowSize);
+        if (row == nullptr || !MakeText(row + profile::Layout.kAlbumNameOffset, name.c_str()) ||
+            !MakeText(row + profile::Layout.kAlbumDescriptionOffset, L"")) {
             InvalidateAlbumTemplate();
             return;  // retried with the next capture
         }
-        Put(row, profile::kAlbumSortIndexOffset, profile::kSortIndexBase);
+        Put(row, profile::Layout.kAlbumSortIndexOffset, profile::kSortIndexBase);
         build.album = row;
         build.album_name = name;
         ImportCoverTexture(context, build);
@@ -1580,26 +1602,26 @@ void BuildAlbumSnapshot(Context& context) {
         if (meting.size() > profile::kMaxSongs) meting.resize(profile::kMaxSongs);
         std::vector<std::byte*> rows;
         rows.reserve(meting.size());
-        const std::array<std::byte, profile::kFStringSize> empty_string{};
+        const std::vector<std::byte> empty_string(profile::Layout.kFStringSize);
         for (std::size_t i = 0; i < meting.size(); ++i) {
             if (context.builder_stopping.load(std::memory_order_acquire)) return;
-            std::byte* const row = NewRow(music_template, profile::kMusicRowSize);
+            std::byte* const row = NewRow(music_template, profile::Layout.kMusicRowSize);
             const std::wstring title = Utf8ToWide(meting[i].name + " - " + meting[i].artist);
-            if (row == nullptr || !MakeText(row + profile::kMusicTitleOffset, title.c_str()) ||
-                !MakeText(row + profile::kMusicDescriptionOffset, L"")) {
+            if (row == nullptr || !MakeText(row + profile::Layout.kMusicTitleOffset, title.c_str()) ||
+                !MakeText(row + profile::Layout.kMusicDescriptionOffset, L"")) {
                 InvalidateMusicTemplate();
                 return;
             }
-            Put(row, profile::kMusicSortIndexOffset,
+            Put(row, profile::Layout.kMusicSortIndexOffset,
                 profile::kSortIndexBase + 0x8000 + static_cast<std::int32_t>(i));
-            std::memcpy(row + profile::kMusicCommentOffset, empty_string.data(), empty_string.size());
-            Put(row, profile::kMusicAlbumIdOffset, MetingAlbumId(base));
-            std::memcpy(row + profile::kMusicEventOffset + profile::kMusicEventSubPathOffset,
+            std::memcpy(row + profile::Layout.kMusicCommentOffset, empty_string.data(), empty_string.size());
+            Put(row, profile::Layout.kMusicAlbumIdOffset, MetingAlbumId(base));
+            std::memcpy(row + profile::Layout.kMusicEventOffset + profile::Layout.kMusicEventSubPathOffset,
                 empty_string.data(), empty_string.size());
-            Put(row, profile::kMusicSourceItemOffset, std::uint64_t{0});
-            Put(row, profile::kMusicSourceQuestOffset, std::uint64_t{0});
-            Put(row, profile::kMusicIsListOffset, std::uint8_t{1});
-            Put(row, profile::kMusicIsHiddenOffset, std::uint8_t{0});
+            Put(row, profile::Layout.kMusicSourceItemOffset, std::uint64_t{0});
+            Put(row, profile::Layout.kMusicSourceQuestOffset, std::uint64_t{0});
+            Put(row, profile::Layout.kMusicIsListOffset, std::uint8_t{1});
+            Put(row, profile::Layout.kMusicIsHiddenOffset, std::uint8_t{0});
             rows.push_back(row);
         }
         build.meting_songs = std::move(rows);
@@ -1608,13 +1630,13 @@ void BuildAlbumSnapshot(Context& context) {
         changed = true;
     }
     if (build.meting_album == nullptr && album_template != nullptr) {
-        std::byte* const row = NewRow(album_template, profile::kAlbumRowSize);
-        if (row == nullptr || !MakeText(row + profile::kAlbumNameOffset, L"Meting") ||
-            !MakeText(row + profile::kAlbumDescriptionOffset, L"")) {
+        std::byte* const row = NewRow(album_template, profile::Layout.kAlbumRowSize);
+        if (row == nullptr || !MakeText(row + profile::Layout.kAlbumNameOffset, L"Meting") ||
+            !MakeText(row + profile::Layout.kAlbumDescriptionOffset, L"")) {
             InvalidateAlbumTemplate();
             return;
         }
-        Put(row, profile::kAlbumSortIndexOffset, profile::kSortIndexBase + 1);
+        Put(row, profile::Layout.kAlbumSortIndexOffset, profile::kSortIndexBase + 1);
         build.meting_album = row;
         changed = true;
     }
@@ -1732,8 +1754,8 @@ void __fastcall RecordRow(void* user, void* element, void* row) {
             recorder->base = static_cast<std::uint32_t>(name);
         }
         if (recorder->listed != nullptr && name != 0 &&
-            static_cast<std::uint8_t>(bytes[profile::kMusicIsListOffset]) != 0 &&
-            static_cast<std::uint8_t>(bytes[profile::kMusicIsHiddenOffset]) == 0) {
+            static_cast<std::uint8_t>(bytes[profile::Layout.kMusicIsListOffset]) != 0 &&
+            static_cast<std::uint8_t>(bytes[profile::Layout.kMusicIsHiddenOffset]) == 0) {
             try {
                 recorder->listed->push_back(name);
             } catch (...) {
@@ -2017,15 +2039,17 @@ void WriteIds(void* array, const std::vector<std::uint64_t>& ids) noexcept {
 }
 
 void* OwnedArray(void* subsystem) noexcept {
+    auto* const context = g_context.load(std::memory_order_acquire);
+    if (context == nullptr || !context->album_layout) return nullptr;
     if (subsystem == nullptr) subsystem = CachedSubsystem();
-    return subsystem == nullptr ? nullptr : static_cast<std::byte*>(subsystem) + profile::kSubsystemOwnedIdsOffset;
+    return subsystem == nullptr ? nullptr : static_cast<std::byte*>(subsystem) + context->album_layout->owned_ids;
 }
 
 std::uint64_t CurrentSongId(void* subsystem) noexcept {
     auto* const context = g_context.load(std::memory_order_acquire);
     std::uint64_t id{};
-    if (context == nullptr || subsystem == nullptr ||
-        !ReadValue(*context, reinterpret_cast<std::uintptr_t>(subsystem) + profile::kSubsystemCurrentIdOffset, id)) {
+    if (context == nullptr || !context->album_layout || subsystem == nullptr ||
+        !ReadValue(*context, reinterpret_cast<std::uintptr_t>(subsystem) + context->album_layout->current_id, id)) {
         return 0;
     }
     return id;
@@ -2216,7 +2240,7 @@ void CallSetCurrentId(void* subsystem, const std::uint64_t id) noexcept {
 bool TakenOver(const Context& context, void* subsystem) noexcept {
     std::uint32_t id{};
     return subsystem != nullptr &&
-        ReadValue(context, reinterpret_cast<std::uintptr_t>(subsystem) + profile::kSubsystemPlayingIdOffset, id) &&
+        ReadValue(context, reinterpret_cast<std::uintptr_t>(subsystem) + context.layout.playing_id, id) &&
         id == profile::kPlayingId;
 }
 
@@ -2310,7 +2334,7 @@ std::uintptr_t CallDuration(const std::uintptr_t original, void* user, void* inf
 
 void WriteDuration(void* info, const float seconds) noexcept {
     __try {
-        *reinterpret_cast<float*>(static_cast<std::byte*>(info) + profile::kDurationInfoSecondsOffset) =
+        *reinterpret_cast<float*>(static_cast<std::byte*>(info) + profile::Layout.kDurationInfoSecondsOffset) =
             seconds;
     } __except (1) {
     }
@@ -2321,7 +2345,7 @@ void WriteDuration(void* info, const float seconds) noexcept {
 void WriteStripDuration(void* strip, const float seconds) noexcept {
     __try {
         *reinterpret_cast<float*>(static_cast<std::byte*>(strip) +
-            profile::kUiStripDurationCacheOffset) = seconds;
+            profile::Layout.kUiStripDurationCacheOffset) = seconds;
     } __except (1) {
     }
 }
@@ -2467,14 +2491,14 @@ std::uintptr_t ResolveDurationLabel(const Context& context, const std::uintptr_t
     std::uintptr_t& strip) noexcept {
     std::uintptr_t tree{}, owner{}, owner_panel{}, label{}, label_vtable{};
     strip = 0;
-    if (!ReadValue(context, panel + profile::kUiOuterOffset, tree) || tree == 0) return 0;
-    if (!ReadValue(context, tree + profile::kUiOuterOffset, owner) || owner == 0) return 0;
-    if (!ReadValue(context, owner + profile::kUiOwnerPanelOffset, owner_panel) ||
+    if (!ReadValue(context, panel + profile::Layout.kUiOuterOffset, tree) || tree == 0) return 0;
+    if (!ReadValue(context, tree + profile::Layout.kUiOuterOffset, owner) || owner == 0) return 0;
+    if (!ReadValue(context, owner + profile::Layout.kUiOwnerPanelOffset, owner_panel) ||
         owner_panel != panel) {
         return 0;
     }
-    if (!ReadValue(context, owner + profile::kUiOwnerStripOffset, strip) || strip == 0) return 0;
-    if (!ReadValue(context, strip + profile::kUiStripDurationLabelOffset, label) ||
+    if (!ReadValue(context, owner + profile::Layout.kUiOwnerStripOffset, strip) || strip == 0) return 0;
+    if (!ReadValue(context, strip + profile::Layout.kUiStripDurationLabelOffset, label) ||
         label == 0 || !ReadValue(context, label, label_vtable) || label_vtable == 0) {
         strip = 0;
         return 0;
@@ -2497,7 +2521,7 @@ void PushDurationLabel(Context& context, const std::optional<std::size_t> reques
         // view +0x10DC and SetTexts the label at view +0x1018.
         CallUnderLease(kDuration2, [&](const std::uintptr_t duration) {
             std::byte info[96] = {};
-            *reinterpret_cast<float*>(info + profile::kDurationInfoSecondsOffset) = seconds;
+            *reinterpret_cast<float*>(info + profile::Layout.kDurationInfoSecondsOffset) = seconds;
             void* inner = info;
             // The panel itself: refresh its length cache the way the game's
             // own query for this panel would have.
@@ -2510,8 +2534,9 @@ void PushDurationLabel(Context& context, const std::optional<std::size_t> reques
             // A synthetic view whose label slot points at the strip's duration
             // label: the game's own callback then writes, through its own
             // formatter, the label the player actually sees.
-            alignas(8) std::byte view[profile::kUiDurationCacheOffset + sizeof(float)] = {};
-            *reinterpret_cast<std::uintptr_t*>(view + profile::kUiDurationLabelOffset) = label;
+            std::vector<std::byte> view_storage(profile::Layout.kUiDurationCacheOffset + sizeof(float));
+            auto* const view = view_storage.data();
+            *reinterpret_cast<std::uintptr_t*>(view + profile::Layout.kUiDurationLabelOffset) = label;
             void* view_user[1] = {view};
             static_cast<void>(CallDuration(duration, view_user, &inner));
         });
@@ -2639,8 +2664,12 @@ char __fastcall DetailCoverDetour(void* self, const std::uint64_t album) {
         // were ready (e.g. right after a hot reload) still gets it once they are.
         // A game album finds no plugin cover there and keeps its own.
         std::uintptr_t klass{};
-        if (ReadValue(*context, reinterpret_cast<std::uintptr_t>(self) + profile::kObjectClassOffset, klass)) {
-            g_disc_album.store(album, std::memory_order_release);
+        if (ReadValue(*context, reinterpret_cast<std::uintptr_t>(self) + profile::Layout.kObjectClassOffset, klass)) {
+            std::uint64_t album_id = album;
+            const auto* candidate = profile::Compatibility.Selected(profile::kDetailCoverPattern);
+            if (!candidate || (candidate->values.at("albumIndirect") != 0 &&
+                !ReadValue(*context, album, album_id))) { EndCallback(api, lease); return result; }
+            g_disc_album.store(album_id, std::memory_order_release);
             g_disc_view_class.store(klass, std::memory_order_release);
             g_disc_view.store(reinterpret_cast<std::uintptr_t>(self), std::memory_order_release);
         }
@@ -2661,8 +2690,8 @@ std::uintptr_t __fastcall PageCoverDetour(void* self, void* item) {
     auto* const context = g_context.load(std::memory_order_acquire);
     std::uint64_t album{};
     if (context != nullptr && item != nullptr &&
-        ReadValue(*context, reinterpret_cast<std::uintptr_t>(item) + profile::kPageItemAlbumIdOffset, album)) {
-        ApplyCover(album, ReadPointer(*context, self, profile::kPageCoverImageOffset));
+        ReadValue(*context, reinterpret_cast<std::uintptr_t>(item) + profile::Layout.kPageItemAlbumIdOffset, album)) {
+        ApplyCover(album, ReadPointer(*context, self, profile::Layout.kPageCoverImageOffset));
     }
     EndCallback(api, lease);
     return result;
@@ -2773,7 +2802,7 @@ void __fastcall ItemSelectedDetour(void* self, void* item) {
     // auto* const context = g_context.load(std::memory_order_acquire);
     // std::uint64_t song{};
     // if (context != nullptr && item != nullptr &&
-    //     ReadValue(*context, reinterpret_cast<std::uintptr_t>(item) + profile::kVehicleItemSongIdOffset, song)) {
+    //     ReadValue(*context, reinterpret_cast<std::uintptr_t>(item) + profile::Layout.kVehicleItemSongIdOffset, song)) {
     //     Log(*context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
     //         "list entry selected: library " + std::string(IsLibrarySongId(*context, song) ? "yes" : "no"));
     // }
@@ -2924,44 +2953,77 @@ std::pair<HookState, std::string> InstallHooks(Context& context) {
             "hifi-vehicle-music-duration-2", false},
     }};
 
-    const auto resolve = [&context](const std::string_view pattern) {
-        std::uintptr_t address{};
-        if (context.signature->resolve(context.signature->user,
-                anomaly::sdk::StringView(profile::kModule), anomaly::sdk::StringView(profile::kSection),
-                anomaly::sdk::StringView(pattern), &address).code != ANOMALY_STATUS_V1_OK) {
-            return std::uintptr_t{0};
-        }
-        return address;
+    const profile::PlaybackSchema playback_schema;
+    const profile::AlbumSchema album_schema;
+    auto playback = anomaly::sdk::ResolveLayout(context.signature, playback_schema.View());
+    if (!playback) return {HookState::SignatureMissing, playback.error()};
+    const auto& layout = playback.value();
+    context.layout = {
+        layout.offset("PlayingID"), layout.offset("Paused"), layout.offset("PlayerType")};
+
+    auto album = anomaly::sdk::ResolveLayout(context.signature, album_schema.View());
+    std::string album_missing;
+    if (album) {
+        if (album.value().offset("PlayerType") != context.layout.player_type)
+            album_missing = "PlayerType witnesses disagree with playback layout";
+        else
+            context.album_layout = AlbumLayout{
+                album.value().offset("CurrentID"), album.value().offset("OwnedIDs")};
+    } else {
+        album_missing = album.error();
+    }
+    if (!album_missing.empty()) context.album_layout.reset();
+
+    // A resolved declaration can still name witnesses this build no longer
+    // contains; that is what a game update looks like, and the name is the only
+    // way to tell which pattern needs a new declaration.
+    std::string absent_witnesses;
+    const auto note_absent = [&absent_witnesses](const std::string_view id) {
+        if (!absent_witnesses.empty()) absent_witnesses += ", ";
+        absent_witnesses += id;
     };
-    // Target of the E8 rel32 at `call`, or 0.
-    const auto call_target = [&context](const std::uintptr_t call) {
-        std::uint8_t opcode{};
-        std::int32_t rel{};
-        if (call == 0 || !ReadValue(context, call, opcode) || opcode != 0xE8 ||
-            !ReadValue(context, call + 1, rel)) {
-            return std::uintptr_t{0};
+    for (const auto& witness : playback_schema.witnesses) {
+        if (layout.address({witness.id.data, witness.id.size}) == 0)
+            note_absent({witness.id.data, witness.id.size});
+    }
+    if (context.album_layout) {
+        for (const auto& witness : album_schema.witnesses) {
+            if (album.value().address({witness.id.data, witness.id.size}) == 0)
+                note_absent({witness.id.data, witness.id.size});
         }
-        return call + 5 + static_cast<std::intptr_t>(rel);
-    };
+    }
+    if (!absent_witnesses.empty()) {
+        Log(context, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
+            "signature witness not found: " + absent_witnesses);
+    }
+
+    const auto resolve = [](std::string_view symbol) { return profile::Compatibility.Address(symbol); };
 
     std::array<std::uintptr_t, kHookCount> addresses{};
-    std::string_view album_missing;
+    std::string skipped;
     for (std::size_t i = 0; i < kHookCount; ++i) {
+        if (i >= kCoreHookCount && !context.album_layout) continue;
         addresses[i] = resolve(targets[i].pattern);
-        if (targets[i].call_site) addresses[i] = call_target(addresses[i]);
         if (addresses[i] != 0) continue;
-        if (i < kCoreHookCount) return {HookState::SignatureMissing, std::string(targets[i].label)};
+        if (RequiredHook(i)) return {HookState::SignatureMissing, std::string(targets[i].label)};
+        if (i < kCoreHookCount) {
+            // A signal the takeover survives without: keep every other hook and
+            // report what is missing instead of giving up the whole takeover.
+            if (!skipped.empty()) skipped += ", ";
+            skipped += targets[i].label;
+            continue;
+        }
         if (album_missing.empty()) album_missing = targets[i].label;
+    }
+    if (!skipped.empty()) {
+        Log(context, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
+            "hook not found: " + skipped + "; that signal is unavailable");
     }
     // Helpers the album rows are built with.
     const std::uintptr_t game_instance = resolve(profile::kGameInstancePattern);
     const std::uintptr_t add_unique = resolve(profile::kAddUniquePattern);
-    const std::uintptr_t set_list_item = resolve(profile::kSetListItemPattern);
-    const std::uintptr_t from_string = call_target(
-        set_list_item == 0 ? 0 : set_list_item + profile::kFTextFromStringCallOffset);
-    const std::uintptr_t sound_call = resolve(profile::kSoundSubsystemCallPattern);
-    const std::uintptr_t sound_subsystem =
-        call_target(sound_call == 0 ? 0 : sound_call + profile::kSoundSubsystemCallOffset);
+    const std::uintptr_t from_string = resolve(profile::kSetListItemPattern);
+    const std::uintptr_t sound_subsystem = resolve(profile::kSoundSubsystemCallPattern);
     if (album_missing.empty()) {
         if (game_instance == 0) album_missing = "game instance";
         else if (add_unique == 0) album_missing = "TArray<FName>::AddUnique";
@@ -2980,14 +3042,14 @@ std::pair<HookState, std::string> InstallHooks(Context& context) {
         const std::uintptr_t object_load = resolve(profile::kObjectArrayPattern);
         std::int32_t rel{};
         const std::uintptr_t object_array = object_load != 0 &&
-                ReadValue(context, object_load + profile::kObjectArrayRelOffset, rel)
-            ? object_load + profile::kObjectArrayInstructionSize + static_cast<std::intptr_t>(rel)
+                ReadValue(context, object_load + profile::Layout.kObjectArrayRelOffset, rel)
+            ? object_load + profile::Layout.kObjectArrayInstructionSize + static_cast<std::intptr_t>(rel)
             : 0;
         const std::uintptr_t serial_xadd = resolve(profile::kSerialCounterPattern);
         std::int32_t serial_rel{};
         const std::uintptr_t serial_counter = serial_xadd != 0 &&
-                ReadValue(context, serial_xadd + profile::kSerialCounterRelOffset, serial_rel)
-            ? serial_xadd + profile::kSerialCounterInstructionEnd +
+                ReadValue(context, serial_xadd + profile::Layout.kSerialCounterRelOffset, serial_rel)
+            ? serial_xadd + profile::Layout.kSerialCounterInstructionEnd +
                 static_cast<std::intptr_t>(serial_rel)
             : 0;
         if (import_texture != 0 && set_item_flags != 0 && object_array != 0 &&
@@ -3029,7 +3091,7 @@ std::pair<HookState, std::string> InstallHooks(Context& context) {
         g_slots[i].generation.store(handle.generation, std::memory_order_release);
         g_slots[i].id.store(handle.id, std::memory_order_release);
     }
-    return {HookState::Installed, {}};
+    return {HookState::Installed, std::move(skipped)};
 }
 
 // The UI event trace that used to sit here resolved FName ids through the Host's
@@ -3479,8 +3541,8 @@ void ResolveDiscFunction(Context& context, const std::uintptr_t material) noexce
         const std::uintptr_t objects = g_object_array.load(std::memory_order_acquire);
         std::uintptr_t klass{};
         std::int32_t total{};
-        if (objects == 0 || !ReadValue(context, material + profile::kObjectClassOffset, klass) || klass == 0 ||
-            !ReadValue(context, objects + profile::kObjectArrayCountOffset, total) || total <= 0) {
+        if (objects == 0 || !ReadValue(context, material + profile::Layout.kObjectClassOffset, klass) || klass == 0 ||
+            !ReadValue(context, objects + profile::Layout.kObjectArrayCountOffset, total) || total <= 0) {
             Log(context, ANOMALY_CORE_LOG_LEVEL_V1_WARNING, "disc cover function lookup unavailable");
             return;
         }
@@ -3490,11 +3552,11 @@ void ResolveDiscFunction(Context& context, const std::uintptr_t material) noexce
             std::uintptr_t object{};
             std::uintptr_t outer{};
             if (item == nullptr || !ReadValue(context, reinterpret_cast<std::uintptr_t>(item), object) ||
-                object == 0 || !ReadValue(context, object + profile::kObjectOuterOffset, outer) || outer != klass) {
+                object == 0 || !ReadValue(context, object + profile::Layout.kObjectOuterOffset, outer) || outer != klass) {
                 continue;
             }
             std::uint32_t name_id{};
-            if (!ReadValue(context, object + profile::kObjectNameOffset, name_id) || name_id == 0) continue;
+            if (!ReadValue(context, object + profile::Layout.kObjectNameOffset, name_id) || name_id == 0) continue;
             std::array<char, 64> buffer{};
             std::size_t size = buffer.size();
             if (context.names->resolve_utf8(context.names->user, name_id, buffer.data(), &size).code !=
@@ -3527,7 +3589,7 @@ void ResolveImportBuffer(Context& context) noexcept {
     if (tried || g_import_buffer.load(std::memory_order_acquire) != 0) return;
     const std::uintptr_t objects = g_object_array.load(std::memory_order_acquire);
     std::int32_t total{};
-    if (objects == 0 || !ReadValue(context, objects + profile::kObjectArrayCountOffset, total) || total <= 0) return;
+    if (objects == 0 || !ReadValue(context, objects + profile::Layout.kObjectArrayCountOffset, total) || total <= 0) return;
     tried = true;
     try {
         std::uint32_t class_name_id{};
@@ -3542,7 +3604,7 @@ void ResolveImportBuffer(Context& context) noexcept {
             std::uintptr_t object{};
             std::uintptr_t klass{};
             if (item == nullptr || !ReadValue(context, reinterpret_cast<std::uintptr_t>(item), object) ||
-                object == 0 || !ReadValue(context, object + profile::kObjectClassOffset, klass) || klass == 0) {
+                object == 0 || !ReadValue(context, object + profile::Layout.kObjectClassOffset, klass) || klass == 0) {
                 continue;
             }
             if (class_class == 0) {
@@ -3552,7 +3614,7 @@ void ResolveImportBuffer(Context& context) noexcept {
                 continue;
             }
             std::uint32_t name{};
-            if (!ReadValue(context, object + profile::kObjectNameOffset, name)) continue;
+            if (!ReadValue(context, object + profile::Layout.kObjectNameOffset, name)) continue;
             if (class_name_id != 0) {
                 if (name == class_name_id) library = object;
                 continue;
@@ -3578,16 +3640,16 @@ void ResolveImportBuffer(Context& context) noexcept {
                 object == 0) {
                 continue;
             }
-            if (default_object == 0 && ReadValue(context, object + profile::kObjectClassOffset, klass) &&
+            if (default_object == 0 && ReadValue(context, object + profile::Layout.kObjectClassOffset, klass) &&
                 klass == library && ObjectName(context, object).rfind("Default__", 0) == 0) {
                 default_object = object;
                 continue;
             }
-            if (function != 0 || !ReadValue(context, object + profile::kObjectOuterOffset, outer) || outer != library) {
+            if (function != 0 || !ReadValue(context, object + profile::Layout.kObjectOuterOffset, outer) || outer != library) {
                 continue;
             }
             std::uint32_t name{};
-            if (!ReadValue(context, object + profile::kObjectNameOffset, name)) continue;
+            if (!ReadValue(context, object + profile::Layout.kObjectNameOffset, name)) continue;
             if (function_name_id != 0 ? name == function_name_id
                                       : ObjectName(context, object) == profile::kImportBufferFunction) {
                 function_name_id = name;
@@ -3600,24 +3662,13 @@ void ResolveImportBuffer(Context& context) noexcept {
                     (function == 0 ? "no ImportBufferAsTexture2D" : "no library default object"));
             return;
         }
-        // ProcessEvent lays the parameters out by the function's own property
-        // offsets, so they must be the layout ImportBufferParameters assumes:
-        // 3 parameters, a 0x20 block, the return value at 0x18. UFunction keeps
-        // them after FunctionFlags as NumParms (u8), a pad byte, ParmsSize (u16)
-        // and ReturnValueOffset (u16) -- read in game at +0xB4/+0xB6/+0xB8 as
-        // 03 00 20 00 18 00. Matched as that run, not at a fixed offset.
-        bool layout_ok = false;
-        for (std::uint32_t offset = 0xA0; offset < 0x100 && !layout_ok; ++offset) {
-            std::uint8_t count{};
-            std::uint16_t size{};
-            std::uint16_t return_offset{};
-            if (ReadValue(context, function + offset, count) && count == 3 &&
-                ReadValue(context, function + offset + 2, size) && size == sizeof(ImportBufferParameters) &&
-                ReadValue(context, function + offset + 4, return_offset) &&
-                return_offset == offsetof(ImportBufferParameters, result)) {
-                layout_ok = true;
-            }
-        }
+        // Validate the reflected function header against the fixed call ABI.
+        std::uint8_t count{};
+        std::uint16_t size{}, return_offset{};
+        const bool layout_ok = ReadValue(context, function + profile::Layout.kFunctionNumParms, count) && count == 3 &&
+            ReadValue(context, function + profile::Layout.kFunctionParmsSize, size) && size == sizeof(ImportBufferParameters) &&
+            ReadValue(context, function + profile::Layout.kFunctionReturnOffset, return_offset) &&
+            return_offset == offsetof(ImportBufferParameters, result);
         if (!layout_ok) {
             Log(context, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
                 "song cover import unavailable: ImportBufferAsTexture2D parameters do not match");
@@ -3638,7 +3689,7 @@ void ResolveImportBuffer(Context& context) noexcept {
 // may block and must not run on the Game thread.
 std::string ObjectName(Context& context, const std::uintptr_t object) {
     std::uint32_t name_id{};
-    if (object == 0 || !ReadValue(context, object + profile::kObjectNameOffset, name_id) || name_id == 0) return {};
+    if (object == 0 || !ReadValue(context, object + profile::Layout.kObjectNameOffset, name_id) || name_id == 0) return {};
     std::array<char, 128> buffer{};
     std::size_t size = buffer.size();
     if (context.names->resolve_utf8(context.names->user, name_id, buffer.data(), &size).code !=
@@ -3666,20 +3717,20 @@ void ResolveDiscParameter(Context& context) noexcept {
         std::uintptr_t material{};
         std::uintptr_t entries{};
         std::int32_t count{};
-        if (!ReadValue(context, view + profile::kDetailCoverImageOffset, image) || image == 0 ||
-            !ReadValue(context, image + profile::kImageBrushResourceOffset, material) || material == 0) {
+        if (!ReadValue(context, view + profile::Layout.kDetailCoverImageOffset, image) || image == 0 ||
+            !ReadValue(context, image + profile::Layout.kImageBrushResourceOffset, material) || material == 0) {
             return;
         }
         ResolveDiscFunction(context, material);
         if (g_disc_parameter_name.load(std::memory_order_acquire) != 0) return;
-        if (!ReadValue(context, material + profile::kMaterialTextureParametersOffset, entries) ||
-            !ReadValue(context, material + profile::kMaterialTextureParametersOffset + 8, count) ||
+        if (!ReadValue(context, material + profile::Layout.kMaterialTextureParametersOffset, entries) ||
+            !ReadValue(context, material + profile::Layout.kMaterialTextureParametersOffset + 8, count) ||
             entries == 0 || count <= 0 || count > 64) {
             return;
         }
         for (std::int32_t i = 0; i < count; ++i) {
             std::uint64_t name{};
-            if (!ReadValue(context, entries + static_cast<std::uintptr_t>(i) * profile::kTextureParameterSize, name)) {
+            if (!ReadValue(context, entries + static_cast<std::uintptr_t>(i) * profile::Layout.kTextureParameterSize, name)) {
                 return;
             }
             std::array<char, 64> buffer{};
@@ -3722,7 +3773,7 @@ void FindPlayerDisc(Context& context) noexcept {
     const std::uintptr_t known = g_player_view.load(std::memory_order_acquire);
     if (known != 0) {
         std::uintptr_t klass{};
-        if (ReadValue(context, known + profile::kObjectClassOffset, klass) &&
+        if (ReadValue(context, known + profile::Layout.kObjectClassOffset, klass) &&
             klass == g_player_view_class.load(std::memory_order_acquire)) {
             return;  // still alive
         }
@@ -3746,8 +3797,8 @@ void FindPlayerDisc(Context& context) noexcept {
         std::uintptr_t mid_class{};
         const std::uintptr_t objects = g_object_array.load(std::memory_order_acquire);
         std::int32_t total{};
-        if (!ReadValue(context, function + profile::kObjectOuterOffset, mid_class) || mid_class == 0 ||
-            objects == 0 || !ReadValue(context, objects + profile::kObjectArrayCountOffset, total)) {
+        if (!ReadValue(context, function + profile::Layout.kObjectOuterOffset, mid_class) || mid_class == 0 ||
+            objects == 0 || !ReadValue(context, objects + profile::Layout.kObjectArrayCountOffset, total)) {
             return;
         }
         for (std::int32_t index = 0; index < total; ++index) {
@@ -3756,7 +3807,7 @@ void FindPlayerDisc(Context& context) noexcept {
             std::uintptr_t material{};
             std::uintptr_t klass{};
             if (item == nullptr || !ReadValue(context, reinterpret_cast<std::uintptr_t>(item), material) ||
-                material == 0 || !ReadValue(context, material + profile::kObjectClassOffset, klass) ||
+                material == 0 || !ReadValue(context, material + profile::Layout.kObjectClassOffset, klass) ||
                 klass != mid_class) {
                 continue;
             }
@@ -3764,24 +3815,21 @@ void FindPlayerDisc(Context& context) noexcept {
             std::uintptr_t tree{};
             std::uintptr_t view{};
             std::uintptr_t view_class{};
-            if (!ReadValue(context, material + profile::kObjectOuterOffset, image) || image == 0 ||
-                !ReadValue(context, image + profile::kObjectOuterOffset, tree) || tree == 0 ||
-                !ReadValue(context, tree + profile::kObjectOuterOffset, view) || view == 0 ||
-                !ReadValue(context, view + profile::kObjectClassOffset, view_class) || view_class == 0 ||
+            if (!ReadValue(context, material + profile::Layout.kObjectOuterOffset, image) || image == 0 ||
+                !ReadValue(context, image + profile::Layout.kObjectOuterOffset, tree) || tree == 0 ||
+                !ReadValue(context, tree + profile::Layout.kObjectOuterOffset, view) || view == 0 ||
+                !ReadValue(context, view + profile::Layout.kObjectClassOffset, view_class) || view_class == 0 ||
                 ObjectName(context, image) != profile::kPlayerDiscImageName ||
                 ObjectName(context, view_class) != profile::kPlayerViewClassName) {
                 continue;
             }
-            // The image's field in the view; the image is the one the brush is on.
-            for (std::uint32_t offset = 0x28; offset < 0x2000; offset += 8) {
-                std::uintptr_t field{};
-                if (!ReadValue(context, view + offset, field) || field != image) continue;
-                g_player_image_offset.store(offset, std::memory_order_release);
-                g_player_view_class.store(view_class, std::memory_order_release);
-                g_player_view.store(view, std::memory_order_release);
-                Log(context, ANOMALY_CORE_LOG_LEVEL_V1_INFO, "player disc found");
-                return;
-            }
+            std::uintptr_t field{};
+            if (!ReadValue(context, view + profile::Layout.kPlayerDiscImageOffset, field) || field != image) continue;
+            g_player_image_offset.store(profile::Layout.kPlayerDiscImageOffset, std::memory_order_release);
+            g_player_view_class.store(view_class, std::memory_order_release);
+            g_player_view.store(view, std::memory_order_release);
+            Log(context, ANOMALY_CORE_LOG_LEVEL_V1_INFO, "player disc found");
+            return;
         }
     } catch (...) {
     }
@@ -3792,7 +3840,10 @@ using ProcessEventFn = void(__fastcall*)(void*, void*, void*);
 bool CallProcessEvent(void* object, const std::uintptr_t function, void* parameters) noexcept {
     __try {
         const auto vtable = *static_cast<std::uintptr_t* const*>(object);
-        reinterpret_cast<ProcessEventFn>(vtable[profile::kProcessEventVtableIndex])(
+        const auto* context = g_context.load(std::memory_order_acquire);
+        if (!context || !profile::Compatibility.MatchesEntry(context->core, "ProcessEvent.entry",
+                vtable[profile::Layout.kProcessEventVtableIndex], true)) return false;
+        reinterpret_cast<ProcessEventFn>(vtable[profile::Layout.kProcessEventVtableIndex])(
             object, reinterpret_cast<void*>(function), parameters);
         return true;
     } __except (1) {
@@ -3810,18 +3861,18 @@ void SetDiscTexture(Context& context, const std::uintptr_t image, void* const te
     std::uintptr_t entries{};
     std::int32_t count{};
     if (function == 0 || parameter == 0 || image == 0 || texture == nullptr ||
-        !ReadValue(context, image + profile::kImageBrushResourceOffset, material) || material == 0 ||
-        !ReadValue(context, material + profile::kMaterialTextureParametersOffset, entries) ||
-        !ReadValue(context, material + profile::kMaterialTextureParametersOffset + 8, count) ||
+        !ReadValue(context, image + profile::Layout.kImageBrushResourceOffset, material) || material == 0 ||
+        !ReadValue(context, material + profile::Layout.kMaterialTextureParametersOffset, entries) ||
+        !ReadValue(context, material + profile::Layout.kMaterialTextureParametersOffset + 8, count) ||
         entries == 0 || count <= 0 || count > 64) {
         return;  // not the expected material instance
     }
     for (std::int32_t i = 0; i < count; ++i) {
-        const std::uintptr_t entry = entries + static_cast<std::uintptr_t>(i) * profile::kTextureParameterSize;
+        const std::uintptr_t entry = entries + static_cast<std::uintptr_t>(i) * profile::Layout.kTextureParameterSize;
         std::uint64_t name{};
         std::uintptr_t value{};
         if (!ReadValue(context, entry, name) ||
-            !ReadValue(context, entry + profile::kTextureParameterValueOffset, value)) {
+            !ReadValue(context, entry + profile::Layout.kTextureParameterValueOffset, value)) {
             return;
         }
         if (name != parameter) continue;
@@ -3840,7 +3891,7 @@ void SetDiscTexture(Context& context, const std::uintptr_t image, void* const te
 void SetRooted(Context& context, void* const object, const bool rooted) noexcept {
     std::int32_t index{};
     if (object == nullptr ||
-        !ReadValue(context, reinterpret_cast<std::uintptr_t>(object) + profile::kObjectIndexOffset, index)) {
+        !ReadValue(context, reinterpret_cast<std::uintptr_t>(object) + profile::Layout.kObjectIndexOffset, index)) {
         return;
     }
     auto* const item = static_cast<std::byte*>(ObjectItem(context, index));
@@ -3850,7 +3901,7 @@ void SetRooted(Context& context, void* const object, const bool rooted) noexcept
         return;
     }
     __try {
-        auto* const flags = reinterpret_cast<volatile LONG*>(item + profile::kObjectItemFlagsOffset);
+        auto* const flags = reinterpret_cast<volatile LONG*>(item + profile::Layout.kObjectItemFlagsOffset);
         InterlockedAnd(flags, ~static_cast<LONG>(profile::kRootSetFlag));
     } __except (1) {
     }
@@ -3924,14 +3975,14 @@ void ApplyDiscCover(Context& context) noexcept {
     std::uintptr_t image{};
     const auto snapshot = g_album.load(std::memory_order_acquire);
     if (view != 0 && snapshot != nullptr &&
-        ReadValue(context, view + profile::kObjectClassOffset, klass) &&
+        ReadValue(context, view + profile::Layout.kObjectClassOffset, klass) &&
         klass == g_disc_view_class.load(std::memory_order_acquire) &&
-        ReadValue(context, view + profile::kDetailCoverImageOffset, image)) {
+        ReadValue(context, view + profile::Layout.kDetailCoverImageOffset, image)) {
         SetDiscTexture(context, image, CoverTexture(*snapshot, g_disc_album.load(std::memory_order_acquire)));
     }
     const std::uintptr_t player = g_player_view.load(std::memory_order_acquire);
     if (player != 0 &&
-        ReadValue(context, player + profile::kObjectClassOffset, klass) &&
+        ReadValue(context, player + profile::Layout.kObjectClassOffset, klass) &&
         klass == g_player_view_class.load(std::memory_order_acquire) &&
         ReadValue(context, player + g_player_image_offset.load(std::memory_order_acquire), image)) {
         SetDiscTexture(context, image, PlayingCoverTexture(context));
@@ -3994,8 +4045,8 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** plugin_co
             ANOMALY_CORE_SERVICE_V1_ID, ANOMALY_CORE_SERVICE_V1_VERSION).get();
         context->config = host_view.Query<AnomalyConfigServiceV1>(
             ANOMALY_CONFIG_SERVICE_V1_ID, ANOMALY_CONFIG_SERVICE_V1_VERSION).get();
-        context->signature = host_view.Query<AnomalySignatureServiceV1>(
-            ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION).get();
+        context->signature = host_view.Query<AnomalySignatureServiceV2>(
+            ANOMALY_SIGNATURE_SERVICE_V2_ID, ANOMALY_SIGNATURE_SERVICE_V2_VERSION).get();
         context->hook = host_view.Query<AnomalyHookServiceV1>(
             ANOMALY_HOOK_SERVICE_V1_ID, ANOMALY_HOOK_SERVICE_V1_VERSION).get();
         context->names = host_view.Query<AnomalyUe5NamesServiceV1>(
@@ -4007,7 +4058,7 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** plugin_co
         context->ahud = host_view.Query<AnomalyUe5AhudServiceV1>(
             ANOMALY_UE5_AHUD_SERVICE_V1_ID, ANOMALY_UE5_AHUD_SERVICE_V1_VERSION).get();
         if (!AhudReady(context->ahud)) context->ahud = nullptr;
-        context->localizer = anomaly::plugins::Localizer(host);
+        context->localizer = anomaly::sdk::Localizer(host);
         if (!CoreReady(context->core) || !ConfigReady(context->config) ||
             !SignatureReady(context->signature) || !HookReady(context->hook) ||
             !NamesReady(context->names) || !SchedulerReady(context->scheduler)) {
@@ -4020,6 +4071,10 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** plugin_co
             context->settings_schema.id == 0) {
             delete context;
             return Status(ANOMALY_STATUS_V1_FAILED, "settings schema registration failed");
+        }
+        if (!profile::Load(host)) {
+            delete context;
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "music compatibility profile is unavailable");
         }
         ReadSettings(*context);
         *plugin_context = context;
@@ -4037,7 +4092,8 @@ AnomalyStatusV1 ANOMALY_CALL Start(void* plugin_context) {
         g_context.store(context, std::memory_order_release);
         auto [state, detail] = InstallHooks(*context);
         if (state == HookState::Installed) {
-            Log(*context, ANOMALY_CORE_LOG_LEVEL_V1_INFO, "music hooks installed");
+            Log(*context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
+                detail.empty() ? "music hooks installed" : "music hooks installed without: " + detail);
         // Diagnostic probe (off): where this build's ChangePlayerMusicSound lives,
         // to calibrate the caller offsets the LogCaller probe logged.
         // {
@@ -4216,13 +4272,15 @@ void StartFolderPicker(Context& context) {
 }
 
 std::string HookStateText(const Context& context) {
-    const anomaly::plugins::Localizer& l10n = context.localizer;
+    const anomaly::sdk::Localizer& l10n = context.localizer;
     const std::array<std::string_view, 1> args{context.hook_detail};
     switch (context.hook_state) {
     case HookState::Waiting:
         return l10n.Text("hooks.waiting", "Hooks: not installed");
     case HookState::Installed:
-        return l10n.Text("hooks.installed", "Hooks: installed");
+        return context.hook_detail.empty()
+            ? l10n.Text("hooks.installed", "Hooks: installed")
+            : l10n.Format("hooks.installed_partial", "Hooks: installed without ({0})", args);
     case HookState::SignatureMissing:
         return l10n.Format("hooks.signature_missing", "Hooks: signature not found ({0})", args);
     case HookState::HookFailed:
@@ -4231,7 +4289,7 @@ std::string HookStateText(const Context& context) {
     return {};
 }
 
-std::string EngineStatusText(const anomaly::plugins::Localizer& l10n,
+std::string EngineStatusText(const anomaly::sdk::Localizer& l10n,
     const hifi_vehicle_music::EngineSnapshot& snapshot) {
     const std::array<std::string_view, 1> args{snapshot.detail};
     switch (snapshot.status) {
@@ -4262,7 +4320,7 @@ std::string EngineStatusText(const anomaly::plugins::Localizer& l10n,
 // Called from Draw with the context mutex held.
 void DrawStatus(Context& context, const AnomalyUiServiceV1* ui,
     const hifi_vehicle_music::EngineSnapshot& snapshot) {
-    const anomaly::plugins::Localizer& l10n = context.localizer;
+    const anomaly::sdk::Localizer& l10n = context.localizer;
     Text(ui, HookStateText(context));
     Text(ui, EngineStatusText(l10n, snapshot));
     {
@@ -4324,7 +4382,7 @@ std::string PlaylistId(const std::string_view input) {
 // The Meting section: search, playlist import and the current song list. A song
 // plays when picked in the game's "Meting" album or with its button here.
 void DrawMeting(Context& context, const AnomalyUiServiceV1* ui) {
-    const anomaly::plugins::Localizer& l10n = context.localizer;
+    const anomaly::sdk::Localizer& l10n = context.localizer;
     Text(ui, l10n.Text("meting.title", "Meting library (memory playback, no audio cache)"));
     const bool busy = context.meting_busy.load(std::memory_order_acquire);
     ui->input_text(ui->user, anomaly::sdk::StringView(l10n.Label("meting.search", "Search songs", "meting-query")),
@@ -4404,7 +4462,7 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
         : context == nullptr ? nullptr : context->ui;
     if (context == nullptr || !UiReady(ui)) return;
     try {
-        const anomaly::plugins::Localizer& l10n = context->localizer;
+        const anomaly::sdk::Localizer& l10n = context->localizer;
         int open = 1;
         anomaly::sdk::UiWindow window(ui, l10n.Label("window.title", "HiFi Vehicle Music",
             "hifi-vehicle-music"), &open);
@@ -4570,7 +4628,7 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
     }
     *descriptor = {
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
-        anomaly::sdk::StringView("anomaly.builtin.hifi-vehicle-music"),
+        anomaly::sdk::StringView("anomaly.hifi-vehicle-music"),
         anomaly::sdk::StringView("HiFi Vehicle Music"),
         anomaly::sdk::StringView("Anomaly"), anomaly::sdk::StringView("1.0.0"),
         Load, Start, Stop, Unload, nullptr, Draw};
