@@ -323,6 +323,9 @@ struct Context final {
     // 最近距离拾取：打开后单个食物的点位按「区域桶 + 桶内最近邻」重排，从玩家当前位置
     // 出发先走同一区域内更近的点。只作用于 item_food，其它类别保持表序。
     std::atomic_bool food_nearest_order{};
+    // 配额判死：勾选后「某区捡够配额就把该区剩余点位整批跳过」才生效。
+    // 默认关——关掉时配额只用来打日志，点位照常跑，靠连续空点收尾。
+    std::atomic_bool quota_region_stop{};
     // Draw 处在 Render 域，读玩家坐标必须在 Game 域做，所以这里只递一个信号。
     std::atomic_bool nearest_sort_pending{};
     // 前瞻标注：某个点位等不到 actor 放弃时，用那次复核扫描顺手判定「到最近有货点位之间
@@ -2433,7 +2436,31 @@ void LogQuotaSummary(Context& context) {
 // record is the only distance-independent signal: the available set holds what is near the
 // player, and the region being visited is by definition the near one, so it always shows
 // entries for a region that has just filled up.
+// 一个区域一周能发多少单食物：E 区 20，其余区域都是 40。
+// 实测里偶尔出现 41~44（B44 / C42 / D41 / E06 41），那是并发提交到服务端造成的溢出，
+// 不是配额本身，拿它当门槛会让每周的判死线随溢出浮动，所以只认 40。
+// E 区点位 38、名额 20（空点率 47%），用 39/40 当门槛它永远判不满，只能退回「连续空点」
+// 那条路去猜，很容易在名额没用完时就误判整区，所以单独给 20。
+constexpr std::uint32_t ItemRegionQuota(const std::string_view region) noexcept {
+    if (region == "E") return 20;
+    return 40;
+}
+
+// key 形如 "Item|A" / "Item|E06" / "Box|E06"。只有单食物有实测配额表，
+// Box 类没有可靠数据，沿用原门槛。
+constexpr std::uint32_t RegionQuotaFor(const std::string_view key) noexcept {
+    const auto bar = key.find('|');
+    if (bar == std::string_view::npos) return kFoodRegionSpentPicks;
+    if (key.substr(0, bar) != "Item") return kFoodRegionSpentPicks;
+    return ItemRegionQuota(key.substr(bar + 1));
+}
+
 void RefreshFoodRegionState(Context& context) noexcept {
+    // 没勾「配额判死」就只做统计：这里直接清空已判死的区，让点位照常跑。
+    if (!context.quota_region_stop.load(std::memory_order_relaxed)) {
+        context.food_spent_groups.clear();
+        return;
+    }
     std::unordered_map<std::string, int> picked;
     std::string key;
     for (const auto& name : context.picked_up_points) {
@@ -2441,7 +2468,7 @@ void RefreshFoodRegionState(Context& context) noexcept {
     }
     context.food_spent_groups.clear();
     for (const auto& entry : picked) {
-        if (entry.second >= static_cast<int>(kFoodRegionSpentPicks)) {
+        if (entry.second >= static_cast<int>(RegionQuotaFor(entry.first))) {
             context.food_spent_groups.insert(entry.first);
             NoteFoodRegionSkipped(
                 context, entry.first,
@@ -5935,6 +5962,26 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
                          &nearest) != 0) {
             context.food_nearest_order.store(nearest != 0, std::memory_order_relaxed);
             context.nearest_sort_pending.store(true, std::memory_order_release);
+        }
+    }
+    // 配额判死：只在最近距离拾取下提供。关掉时某区捡够配额也不再整区跳过，
+    // 该区剩下的点位照常跑，只靠「连续空点」收尾——时间会明显变长，但不会因为
+    // 门槛估低而提前丢掉还有货的区。
+    if ((type_choice == 6 || type_choice == 7) && ui->checkbox != nullptr &&
+        context.food_nearest_order.load(std::memory_order_relaxed)) {
+        int quota_stop =
+            context.quota_region_stop.load(std::memory_order_relaxed) ? 1 : 0;
+        const std::string quota_stop_label =
+            context.localizer.Text("label.quota_stop", "Region quota stop");
+        if (ui->checkbox(ui->user, anomaly::sdk::StringView(quota_stop_label),
+                         &quota_stop) != 0) {
+            const bool enabled = quota_stop != 0;
+            context.quota_region_stop.store(enabled, std::memory_order_relaxed);
+            if (!enabled) {
+                // 立刻放开已经判死的区，不等下一次 30 秒刷新。
+                std::lock_guard<std::mutex> lock(context.mutex);
+                context.food_spent_groups.clear();
+            }
         }
     }
     // 单个食物筛选。勾选 = 要拾取：拾取前会按箱子的实际蓝图类判定物品，没勾选的直接跳过。
