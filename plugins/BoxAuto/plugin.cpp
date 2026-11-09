@@ -2723,7 +2723,7 @@ std::uint32_t CountSameRegionActorsNear(
     deviation_cm = -1;
     if (context.all_points.empty()) return 0;
     if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
+        !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
                             context.g_objects_address)) {
         return 0;
     }
@@ -2731,22 +2731,26 @@ std::uint32_t CountSameRegionActorsNear(
     std::int32_t num_chunks{};
     std::uintptr_t items{};
     if (!Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectItemsOffset), items) ||
+                  context.g_objects_address + native_layout.kObjectItemsOffset), items) ||
         items == 0 ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectCountOffset), count) ||
+                  context.g_objects_address + native_layout.kObjectCountOffset), count) ||
         !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectNumChunksOffset), num_chunks) ||
+                  context.g_objects_address + native_layout.kObjectNumChunksOffset), num_chunks) ||
         count <= 0 || num_chunks <= 0) {
         return 0;
     }
     const double radius_squared =
         kEmptyRecheckRadiusCentimeters * kEmptyRecheckRadiusCentimeters;
+    // 类名前缀跟着点位类别走：单食物 PropBox_Once_、食物箱 PropBox_Yahaha_。
+    std::string food_prefix(ActorPrefixForCategory(p.category));
+    if (food_prefix.empty()) return 0;
+    food_prefix.push_back('_');
     std::uint32_t same_region{};
     std::uint32_t current_chunk_index = 0xFFFFFFFFu;
     std::uintptr_t chunk{};
     for (std::int32_t i = 0; i < count; ++i) {
-        const auto chunk_index = static_cast<std::uint32_t>(i) / kObjectChunkSize;
+        const auto chunk_index = static_cast<std::uint32_t>(i) / native_layout.kObjectChunkSize;
         if (chunk_index != current_chunk_index) {
             current_chunk_index = chunk_index;
             if (!Read(reinterpret_cast<const void*>(
@@ -2756,16 +2760,16 @@ std::uint32_t CountSameRegionActorsNear(
                 continue;
             }
         }
-        const auto within = static_cast<std::uint32_t>(i) % kObjectChunkSize;
+        const auto within = static_cast<std::uint32_t>(i) % native_layout.kObjectChunkSize;
         std::uintptr_t object{};
         if (!Read(reinterpret_cast<const void*>(
-                      chunk + static_cast<std::uintptr_t>(within) * kObjectItemStride),
+                      chunk + static_cast<std::uintptr_t>(within) * native_layout.kObjectItemStride),
                   object) ||
             object == 0) {
             continue;
         }
         std::uintptr_t cls{};
-        if (!Read(reinterpret_cast<const void*>(object + kObjectClassOffset), cls) ||
+        if (!Read(reinterpret_cast<const void*>(object + native_layout.kObjectClassOffset), cls) ||
             cls == 0) {
             continue;
         }
@@ -2782,18 +2786,18 @@ std::uint32_t CountSameRegionActorsNear(
         if (cls_name.find("PropBox_Once") == std::string::npos) continue;
         if (FoodItemIndexForClass(cls_name) >= kFoodItems.size()) continue;
         std::uintptr_t root{};
-        if (!Read(reinterpret_cast<const void*>(object + kActorRootComponentOffset),
+        if (!Read(reinterpret_cast<const void*>(object + native_layout.kActorRootComponentOffset),
                   root) ||
             root == 0) {
             continue;
         }
         double bx{}, by{}, bz{};
-        if (!Read(reinterpret_cast<const void*>(root + kSceneComponentLocationOffset),
+        if (!Read(reinterpret_cast<const void*>(root + native_layout.kSceneComponentLocationOffset),
                   bx) ||
             !Read(reinterpret_cast<const void*>(
-                      root + kSceneComponentLocationOffset + 8), by) ||
+                      root + native_layout.kSceneComponentLocationOffset + 8), by) ||
             !Read(reinterpret_cast<const void*>(
-                      root + kSceneComponentLocationOffset + 16), bz)) {
+                      root + native_layout.kSceneComponentLocationOffset + 16), bz)) {
             continue;
         }
         const double dist_squared = PlanarDistanceSquared(bx, by, p.x, p.y);
@@ -3714,7 +3718,7 @@ void TickFoodPickup(Context& context, const Point& p,
         context.food_filter_enabled.load(std::memory_order_relaxed)) {
         std::uintptr_t actor_class{};
         if (Read(reinterpret_cast<const void*>(
-                     context.target_actor + kObjectClassOffset), actor_class) &&
+                     context.target_actor + native_layout.kObjectClassOffset), actor_class) &&
             actor_class != 0) {
             const std::string class_name = ObjectName(context.names, actor_class);
             const std::size_t item_index = FoodItemIndexForClass(class_name);
