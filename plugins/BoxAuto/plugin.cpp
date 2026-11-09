@@ -348,6 +348,11 @@ struct Context final {
     bool point_interact_sent{};
     std::string point_finish{"none"};
     const char* point_actor{"none"};
+    // 当前目标 actor 的蓝图类名，由 ScanForActor 命中时带出来。
+    // 拾取成功那一刻 actor 可能已被销毁，所以不能等到那时再读。
+    std::string target_class_name;
+    // 本轮各物品的拾取次数，键是 drop id（查不到类名时记 unknown）。
+    std::unordered_map<std::string, std::uint32_t> picked_item_counts;
     // 上一个点位的坐标：用来在耗时日志里带上「从上一个点跳到这里的距离」，
     // 以便直接验证「跳得越近等得越少」这个前提。
     double last_point_x{};
@@ -605,6 +610,7 @@ void LogPointResult(Context& context) noexcept;
 void ResetPointState(Context& context) noexcept {
     // 离开点位：先把这一点的结果写进日志，再清状态。
     LogPointResult(context);
+    context.target_class_name.clear();
     context.teleported = false;
     context.moving = false;
     context.interacted = false;
@@ -2646,7 +2652,10 @@ void BuildClassMap(Context& context) noexcept {
 }
 
 std::uintptr_t ScanForActor(Context& context, const Point& p,
-                           const std::string_view type_prefix) noexcept {
+                           const std::string_view type_prefix,
+                           // 可选：把命中 actor 的蓝图类名带出去。类名缓存是进程内永久的，
+                           // 这里只是查一次哈希表，不额外遍历对象表。
+                           std::string* out_class_name = nullptr) noexcept {
     if (context.g_objects_address == 0 &&
         !ResolveRipRelative(context, kGObjectsPattern, native_layout.kGObjectsAddend,
                             context.g_objects_address)) {
@@ -2766,6 +2775,12 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
             }
             best = object;
             best_dist = dist;
+            if (out_class_name != nullptr) {
+                const auto cls_it = context.class_name_cache.find(cls);
+                *out_class_name = cls_it != context.class_name_cache.end()
+                    ? cls_it->second
+                    : ObjectName(context.names, cls);
+            }
         }
     }
     if (best != 0 &&
@@ -3014,6 +3029,7 @@ void Begin(Context& context) {
         context.current_index = 0;
     }
     context.picked = 0;
+    context.picked_item_counts.clear();
     context.food_empty_groups.clear();
     context.food_empty_group.clear();
     context.food_empty_run = 0;
@@ -3818,6 +3834,21 @@ std::string PickupSnapshotTag(const AnomalyNtePickupSnapshotV1& snapshot) {
            std::to_string(snapshot.unconfirmed);
 }
 
+// 蓝图类名 → 物品名 / drop id。前缀按类别取：单食物 PropBox_Once_、食物箱 PropBox_Yahaha_。
+// 命中不了 13 种就返回 false——日志里始终保留原始 class=，方便事后核对映射对不对。
+bool DescribeFoodItem(const std::string_view category, const std::string& class_name,
+                      std::string& out_name, std::string& out_drop) {
+    if (class_name.empty()) return false;
+    std::string prefix(ActorPrefixForCategory(category));
+    if (prefix.empty()) return false;
+    if (prefix.back() != '_') prefix.push_back('_');
+    const std::size_t index = FoodItemIndexForClassWithPrefix(prefix, class_name);
+    if (index >= kFoodItems.size()) return false;
+    out_name.assign(kFoodItems[index].display_name);
+    out_drop.assign(kFoodItems[index].drop_id);
+    return true;
+}
+
 void TickFoodPickup(Context& context, const Point& p,
                     const std::chrono::steady_clock::time_point now) {
     // 点位计时从这里开始：第一次进入该点时开始，之后同一轮重试不重置，直到 actor 出现或放弃。
@@ -3839,10 +3870,11 @@ void TickFoodPickup(Context& context, const Point& p,
         context.point_actor = "none";
     }
     if (context.target_actor == 0) {
-        context.target_actor =
-            ScanForActor(context, p, ActorPrefixForCategory(p.category));
+        context.target_actor = ScanForActor(
+            context, p, ActorPrefixForCategory(p.category), &context.target_class_name);
         if (context.target_actor == 0 && p.category == "prison") {
-            context.target_actor = ScanForActor(context, p, "Prison");
+            context.target_actor =
+                ScanForActor(context, p, "Prison", &context.target_class_name);
         }
         if (context.target_actor == 0) {
             ++context.point_load_polls;
@@ -4154,6 +4186,18 @@ void TickFoodPickup(Context& context, const Point& p,
                 context.point_finish = "confirmed-" + PickupSnapshotTag(snapshot);
                 context.point_actor =
                     IsObjectInGObjects(context, context.target_actor) ? "alive" : "gone";
+                std::string item_name;
+                std::string item_drop;
+                const bool mapped =
+                    DescribeFoodItem(p.category, context.target_class_name, item_name,
+                                     item_drop);
+                ++context.picked_item_counts[mapped ? item_drop : std::string("unknown")];
+                LogBox(context, "picked-item point=" + p.row_name + " cat=" + p.category +
+                    " class=" + (context.target_class_name.empty()
+                                     ? std::string("unknown")
+                                     : context.target_class_name) +
+                    " item=" + (mapped ? item_name : std::string("-")) +
+                    " drop=" + (mapped ? item_drop : std::string("-")));
                 NoteFoodPointFound(context, p.row_name);
                 ++context.picked;
                 ++context.current_index;
@@ -4748,6 +4792,21 @@ void Tick(Context& context) {
         LogBox(context, "run done points=" + std::to_string(context.current_index) +
             "/" + std::to_string(context.filtered_points.size()) +
             " picked=" + picked_str + " skipped=" + skipped_str);
+        // 按物品汇总本轮产出：drop id 计数，多的在前；查不到类名的记在 unknown。
+        if (!context.picked_item_counts.empty()) {
+            std::vector<std::pair<std::string, std::uint32_t>> items(
+                context.picked_item_counts.begin(), context.picked_item_counts.end());
+            std::sort(items.begin(), items.end(),
+                      [](const auto& a, const auto& b) {
+                          if (a.second != b.second) return a.second > b.second;
+                          return a.first < b.first;
+                      });
+            std::string summary = "picked-items";
+            for (const auto& entry : items) {
+                summary += " " + entry.first + "=" + std::to_string(entry.second);
+            }
+            LogBox(context, summary);
+        }
         return;
     }
     const Point& p = context.filtered_points[context.current_index];
