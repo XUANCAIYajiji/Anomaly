@@ -1647,6 +1647,11 @@ constexpr std::array<FoodItemInfo, 13> kFoodItems{{
     {'M', "Food_026", "噗卡巧克力「绘莉巡演纪念款」"},
 }};
 
+// 「只拾取勾选的单个食物」这个筛选面板暂时下架：置 false 时不渲染界面，
+// food_filter_enabled 拿不到置真，拾取前那段判定自然空跑，等于 13 种单食物全捡。
+// 状态字段、判定逻辑、文案都保留，想恢复把这个常量改回 true 即可。
+constexpr bool kShowFoodFilterUi = false;
+
 // 命中返回 kFoodItems 下标；不是 13 个单食物类之一则返回 kFoodItems.size()。
 // 同前缀的其它类别（例如监狱资源 PropBox_Once_<其它字母>_…）会在这里落空，因此不受筛选影响。
 // prefix 要带尾部下划线：单食物 "PropBox_Once_"、食物箱 "PropBox_Yahaha_"。
@@ -5992,7 +5997,8 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     // 只影响 kFoodItems 里那 13 个单食物类，其它类别不经过这段判定（TickFoodPickup 的
     // FoodItemIndexForClass 查不到就放行）。所以这里也只在单个食物下显示：别的类别勾了
     // 也不会生效，露出来只会让人以为勾上有用。
-    if (CategoryForChoice(type_choice) == "item_food" && ui->checkbox != nullptr) {
+    if (kShowFoodFilterUi && CategoryForChoice(type_choice) == "item_food" &&
+        ui->checkbox != nullptr) {
         int filter_enabled =
             context.food_filter_enabled.load(std::memory_order_relaxed) ? 1 : 0;
         const std::string filter_label = context.localizer.Text(
