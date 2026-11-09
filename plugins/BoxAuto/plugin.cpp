@@ -325,6 +325,10 @@ struct Context final {
     std::atomic_bool food_nearest_order{};
     // Draw 处在 Render 域，读玩家坐标必须在 Game 域做，所以这里只递一个信号。
     std::atomic_bool nearest_sort_pending{};
+    // 前瞻标注：某个点位等不到 actor 放弃时，用那次复核扫描顺手判定「到最近有货点位之间
+    // 这段哪些确认是空点」，轮到它们时直接跳过，不再一个个等满一轮加载窗口。
+    // 只标玩家 250 m 内（扫得到）的点位；更远的扫不到，不能据此判空。
+    std::unordered_set<std::string> known_empty_points;
     // 点位耗时观测：记录「到这个点后等了多久才看到箱子 actor」。用来区分慢在「世界/actor
     // 生成」还是慢在别处——排序优化只对前者有意义。每个点位开始时重置，actor 出现或放弃时
     // 打一条日志。只读观测，不参与任何判定。
@@ -2745,7 +2749,9 @@ std::uintptr_t ScanForActor(Context& context, const Point& p,
 // 偏了几十米，只有反查最近点位才能分清「是自己的」还是「隔壁的」。
 std::uint32_t CountSameRegionActorsNear(
     Context& context, const Point& p, const std::string_view region_key,
-    long long& nearest_cm, long long& deviation_cm) noexcept {
+    long long& nearest_cm, long long& deviation_cm,
+    // 可选：把每个 actor 反查到的「所属点位名」带出去，供前瞻标注定位它在排序中的位置。
+    std::vector<std::string>* out_owner_names = nullptr) noexcept {
     nearest_cm = -1;
     deviation_cm = -1;
     if (context.all_points.empty()) return 0;
@@ -2871,6 +2877,57 @@ std::uint32_t CountSameRegionActorsNear(
     return same_region;
 }
 
+// 前瞻标注覆盖的距离。实测加载半径 292~297 m，贴边处流送可能还没完成（5.5% 的点位
+// 要等 1 秒以上 actor 才出现），所以留 40 m 余量：只有这个范围内的点位才算「扫得到」。
+constexpr double kForwardScanRadiusCentimeters = 25000.0;
+// 一次往后看多少个点位。超过这个长度的标注意义不大——走完要一分多钟，期间名额可能变。
+constexpr std::size_t kForwardScanPointWindow = 40;
+
+// 放弃点位时调用：owner_names 是这次复核扫描看到的同区 actor 所属的点位名。
+// 它们在排序里的位置就是「确定有货」的锚点；当前点位到最近锚点之间、且距玩家 250 m 内
+// 的点位，都是扫描确认过没有 actor 的，记进 known_empty_points，轮到它们时直接跳过。
+// 注意：调用点在 Tick 里，context.mutex 已经持有，这里不能再加锁（非递归锁会死锁）。
+void AnnotateFollowingPoints(Context& context, const std::string_view category,
+                             const std::vector<std::string>& owner_names) {
+    // 先清空：每次空点都重新判定，避免沿用上一次（几分钟前）的结论。
+    // 这一步放在空检查之前，否则 same=0 时旧标注会一直留着。
+    context.known_empty_points.clear();
+    if (owner_names.empty()) return;
+    double player[3]{};
+    if (!SnapshotPlayerPosition(context, player)) return;
+    std::unordered_set<std::string> anchors(owner_names.begin(), owner_names.end());
+    const double gate_squared =
+        kForwardScanRadiusCentimeters * kForwardScanRadiusCentimeters;
+    const std::size_t begin = context.current_index + 1;
+    std::size_t end = begin + kForwardScanPointWindow;
+    if (context.filtered_points.size() < end) end = context.filtered_points.size();
+    std::size_t anchor_index = end;   // 排序上最近的一个「确定有货」位置
+    std::size_t marked = 0;
+    std::size_t scanned = 0;
+    for (std::size_t i = begin; i < end; ++i) {
+        const Point& q = context.filtered_points[i];
+        if (anchors.find(q.row_name) != anchors.end()) {
+            anchor_index = i;
+            break;   // 升序遍历，第一个命中就是最近的那个
+        }
+        // 只标跟当前点位同类的：扫描时的类名前缀是按类别取的，跨类标注会标错。
+        if (q.category != category) continue;
+        ++scanned;
+        // 距离门：圈外的点位扫不到 actor，不能据此判空，原样留给主流程。
+        if (PlanarDistanceSquared(q.x, q.y, player[0], player[1]) > gate_squared) continue;
+        context.known_empty_points.insert(q.row_name);
+        ++marked;
+    }
+    if (marked != 0) {
+        LogBox(context, "forward-mark anchored=" +
+            std::to_string(anchor_index < end ? static_cast<long long>(anchor_index -
+                context.current_index) : -1) +
+            " scanned=" + std::to_string(scanned) +
+            " empty=" + std::to_string(marked) +
+            " actors=" + std::to_string(owner_names.size()));
+    }
+}
+
 bool Teleport(Context& context, const Point& p) noexcept {
     if (context.session == nullptr || context.player == nullptr ||
         context.teleport == nullptr || context.teleport->teleport == nullptr) {
@@ -2925,6 +2982,7 @@ void Begin(Context& context) {
     context.food_empty_group.clear();
     context.food_empty_run = 0;
     context.food_skip_logged.clear();
+    context.known_empty_points.clear();
     context.point_result_active = false;
     context.point_wait_ms = -1;
     context.point_interact_sent = false;
@@ -3793,15 +3851,19 @@ void TickFoodPickup(Context& context, const Point& p,
                     if (FoodGroupOf(p.row_name, region_key)) {
                         long long recheck_nearest_cm = -1;
                         long long recheck_deviation_cm = -1;
+                        std::vector<std::string> owner_names;
                         const std::uint32_t same_region = CountSameRegionActorsNear(
                             context, p, region_key, recheck_nearest_cm,
-                            recheck_deviation_cm);
+                            recheck_deviation_cm, &owner_names);
                         LogBox(context, "empty-check point=" + p.row_name +
                             " region=" + region_key + " same=" +
                             std::to_string(same_region) + " near_cm=" +
                             std::to_string(recheck_nearest_cm) + " dev_cm=" +
                             std::to_string(recheck_deviation_cm));
                         count_as_empty = same_region == 0;
+                        // 这次扫描别浪费：把「当前点到最近有货点位之间确认是空的」标出来。
+                        // 没有同区 actor 就没什么可锚定，照主流程继续走。
+                        AnnotateFollowingPoints(context, p.category, owner_names);
                     }
                 }
                 if (count_as_empty) NoteFoodPointEmpty(context, p.row_name);
@@ -4653,6 +4715,20 @@ void Tick(Context& context) {
         return;
     }
     const Point& p = context.filtered_points[context.current_index];
+    // 前瞻标注过「刚才扫描确认没货」的点位直接跳过：不传送、不等一轮加载窗口。
+    // 标注只在空点放弃那一刻生成，只覆盖扫描确认过的范围，轮到这里就是白等。
+    if (!context.known_empty_points.empty() &&
+        context.known_empty_points.find(p.row_name) != context.known_empty_points.end()) {
+        LogBox(context, "forward-skip point=" + p.row_name);
+        ++context.skipped;
+        ++context.current_index;
+        ResetPointState(context);
+        context.due = now;
+        const std::array forward_skip_args{std::string_view(p.row_name)};
+        context.status = context.localizer.Format(
+            "status.not_found_skip", "Not found, skip {0}", forward_skip_args);
+        return;
+    }
     // 掉出世界（地形没加载好时会真的往下掉）对所有类别统一处理：立刻重传，不等待——
     // 等待会摔死（用户实测）。次数给得宽松，地形加载慢时也能撑过去。
     // 判据只看**玩家自己**的高度变化，不看点位高度：点位 z 常在货架/箱子上，比人站的地面
