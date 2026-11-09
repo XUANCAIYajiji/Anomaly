@@ -336,6 +336,8 @@ struct Context final {
     // 生成」还是慢在别处——排序优化只对前者有意义。每个点位开始时重置，actor 出现或放弃时
     // 打一条日志。只读观测，不参与任何判定。
     std::chrono::steady_clock::time_point point_started_at{};
+    // 本轮开始时刻：跑完时算总耗时，显示在面板状态行。
+    std::chrono::steady_clock::time_point run_started_at{};
     bool point_timing_active{};
     std::uint32_t point_load_polls{};
     // 点位结果日志：每个点位离开时汇总一条，回答「这个点到底怎么了」。
@@ -3029,6 +3031,7 @@ void Begin(Context& context) {
         context.current_index = 0;
     }
     context.picked = 0;
+    context.run_started_at = std::chrono::steady_clock::now();
     context.picked_item_counts.clear();
     context.food_empty_groups.clear();
     context.food_empty_group.clear();
@@ -4783,10 +4786,19 @@ void Tick(Context& context) {
         context.running = false;
         const std::string picked_str = std::to_string(context.picked);
         const std::string skipped_str = std::to_string(context.skipped);
-        const std::array completed_args{
-            std::string_view(picked_str), std::string_view(skipped_str)};
+        // 耗时按分钟保留一位小数：整数秒四舍五入到 0.1 分钟，避免引 snprintf。
+        const long long elapsed_seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - context.run_started_at).count();
+        const long long elapsed_tenths = (elapsed_seconds * 10 + 30) / 60;
+        const std::string elapsed_str =
+            std::to_string(elapsed_tenths / 10) + "." +
+            std::to_string(elapsed_tenths % 10);
+        const std::array completed_args{std::string_view(picked_str),
+                                        std::string_view(skipped_str),
+                                        std::string_view(elapsed_str)};
         context.status = context.localizer.Format(
-            "status.completed", "Completed: picked {0}, skipped {1}",
+            "status.completed", "Completed: picked {0}, skipped {1}, {2} min",
             completed_args);
         // 本轮汇总。配合读表那条 table/run 日志，就能直接算出漏了多少个点位。
         LogBox(context, "run done points=" + std::to_string(context.current_index) +

@@ -45,7 +45,7 @@
     "status.started": "开始",
     "status.stopped": "已停止",
     "status.no_controller": "无法获取 player controller",
-    "status.completed": "完成：拾取 {0}，跳过 {1}",
+    "status.completed": "完成：拾取 {0}，跳过 {1}，耗时 {2} 分钟",
     "status.teleporting": "传送 [{0}]",
     "status.teleport_failed": "传送失败，跳过 [{0}]",
     "status.navigation_unavailable": "导航不可用，跳过 [{0}]",
