@@ -1591,6 +1591,11 @@ constexpr std::string_view ActorPrefixForChoice(const std::uint32_t choice) noex
     }
 }
 
+// 会走「点位表 + 空点判死 + 就近排序」这一整套的类别：单食物和食物箱。
+constexpr bool IsFoodPointCategory(const std::string_view category) noexcept {
+    return category == "item_food" || category == "box_food";
+}
+
 constexpr std::string_view ActorPrefixForCategory(
     const std::string_view category) noexcept {
     if (category == "hunter") return "HunterBox_";
@@ -1637,8 +1642,11 @@ constexpr std::array<FoodItemInfo, 13> kFoodItems{{
 
 // 命中返回 kFoodItems 下标；不是 13 个单食物类之一则返回 kFoodItems.size()。
 // 同前缀的其它类别（例如监狱资源 PropBox_Once_<其它字母>_…）会在这里落空，因此不受筛选影响。
-constexpr std::size_t FoodItemIndexForClass(const std::string_view class_name) noexcept {
-    constexpr std::string_view kClassPrefix = "PropBox_Once_";
+// prefix 要带尾部下划线：单食物 "PropBox_Once_"、食物箱 "PropBox_Yahaha_"。
+// 两种箱子的类名结构一样（PropBox_<系列>_<字母>_Area..），所以同一套字母校验通用；
+// 字母校验本身是用来排掉同前缀的其它变体（监狱资源也挂在 PropBox_Once 下）。
+constexpr std::size_t FoodItemIndexForClassWithPrefix(
+    const std::string_view kClassPrefix, const std::string_view class_name) noexcept {
     if (class_name.size() <= kClassPrefix.size() + 1) return kFoodItems.size();
     if (class_name.compare(0, kClassPrefix.size(), kClassPrefix) != 0) {
         return kFoodItems.size();
@@ -1649,6 +1657,10 @@ constexpr std::size_t FoodItemIndexForClass(const std::string_view class_name) n
         if (kFoodItems[i].letter == letter) return i;
     }
     return kFoodItems.size();
+}
+
+constexpr std::size_t FoodItemIndexForClass(const std::string_view class_name) noexcept {
+    return FoodItemIndexForClassWithPrefix("PropBox_Once_", class_name);
 }
 
 // Caller must hold context.mutex.
@@ -2798,8 +2810,10 @@ std::uint32_t CountSameRegionActorsNear(
             cls_name = ObjectName(context.names, cls);
             context.class_name_cache[cls] = cls_name;
         }
-        if (cls_name.find("PropBox_Once") == std::string::npos) continue;
-        if (FoodItemIndexForClass(cls_name) >= kFoodItems.size()) continue;
+        if (cls_name.compare(0, food_prefix.size(), food_prefix) != 0) continue;
+        if (FoodItemIndexForClassWithPrefix(food_prefix, cls_name) >= kFoodItems.size()) {
+            continue;
+        }
         std::uintptr_t root{};
         if (!Read(reinterpret_cast<const void*>(object + native_layout.kActorRootComponentOffset),
                   root) ||
@@ -2838,7 +2852,15 @@ std::uint32_t CountSameRegionActorsNear(
             context.picked_up_points.end()) {
             continue;
         }
+        // 表外 actor：离最近的静态点位超过 4 m，说明它不生成在任何点位上（运行时动态刷的，
+        // 或者那份表里缺行）。拿它当「这区还有货」会一直拖住 empty-run，拿它当锚点会把人
+        // 送到一个没有箱子的点位上，所以整条不计。
+        if (nearest_dist_squared >
+            kTargetActorMaxDistanceCentimeters * kTargetActorMaxDistanceCentimeters) {
+            continue;
+        }
         ++same_region;
+        if (out_owner_names != nullptr) out_owner_names->push_back(owner.row_name);
         const long long to_point =
             static_cast<long long>(std::sqrt(dist_squared));
         const long long to_owner =
@@ -2890,7 +2912,7 @@ void Begin(Context& context) {
     // 最近距离拾取：开始这一刻按玩家当前位置重排一次。列表在面板上看到的就是接下来
     // 实际要走的顺序，所以「起始索引」在这个模式下不参与（跳过的含义和就近排序冲突）。
     if (context.food_nearest_order.load(std::memory_order_relaxed) &&
-        CategoryForChoice(context.type_choice) == "item_food") {
+        IsFoodPointCategory(CategoryForChoice(context.type_choice))) {
         double position[3]{};
         if (SnapshotPlayerPosition(context, position)) {
             SortPointsByRegionThenProximity(context.filtered_points, position[0],
@@ -3761,7 +3783,12 @@ void TickFoodPickup(Context& context, const Point& p,
                 // 点位正刷着箱子。有就说明这个点只是恰好此刻没货，不计入「连续空点」，避免把
                 // 还剩下货的整片区域丢掉；没有才照常计数。
                 bool count_as_empty = true;
-                if (p.category == "item_food") {
+                // 单食物和食物箱都做复核：前者早就有，后者一直没做，空点一律计数，
+                // 结果箱子只能靠「连续三空」判死，容易把还有货的整片区域丢掉。
+                // 只在就近排序下生效：标注的几何前提（区间内路径连续）靠排序成立，
+                // 表序是 80 km、跳跃更多，中间点容易落在加载圈外，标了就会误杀。
+                if ((p.category == "item_food" || p.category == "box_food") &&
+                    context.food_nearest_order.load(std::memory_order_relaxed)) {
                     std::string region_key;
                     if (FoodGroupOf(p.row_name, region_key)) {
                         long long recheck_nearest_cm = -1;
@@ -5528,7 +5555,8 @@ void ANOMALY_CALL Update(void* plugin_context, const double delta_seconds) {
         const bool have_position =
             enabled && SnapshotPlayerPosition(context, position);
         std::lock_guard<std::mutex> lock(context.mutex);
-        if (CategoryForChoice(context.type_choice) == "item_food" && !context.running) {
+        if (IsFoodPointCategory(CategoryForChoice(context.type_choice)) &&
+            !context.running) {
             if (!enabled) {
                 RebuildFilteredLocked(context);
             } else if (have_position) {
@@ -5820,9 +5848,9 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
             "Shop stealing requires the Zankou skill.");
         ui->text(ui->user, anomaly::sdk::StringView(requirement));
     }
-    // 最近距离拾取：只在单个食物下显示。打开后点位按「区域内就近」重排，下面列表的顺序
-    // 就是接下来实际要走的顺序；关掉就回到表序。
-    if (type_choice == 7 && ui->checkbox != nullptr) {
+    // 最近距离拾取：单食物和食物箱都显示。打开后点位按「区域内就近」重排，下面列表的
+    // 顺序就是接下来实际要走的顺序；关掉就回到表序。
+    if ((type_choice == 6 || type_choice == 7) && ui->checkbox != nullptr) {
         int nearest =
             context.food_nearest_order.load(std::memory_order_relaxed) ? 1 : 0;
         const std::string nearest_label =
@@ -5915,7 +5943,8 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     // read-only state source is found.
     const bool oracle_type = type_choice == 10 && context.oracle != nullptr;
     // 最近距离模式永远从最近的点开始，「跳过前 N 个」和就近排序的含义冲突，所以不显示。
-    const bool nearest_order = type_choice == 7 &&
+    const bool nearest_order =
+        (type_choice == 6 || type_choice == 7) &&
         context.food_nearest_order.load(std::memory_order_relaxed);
     if (!oracle_type) {
         if (!nearest_order) {
