@@ -331,6 +331,16 @@ struct Context final {
     std::chrono::steady_clock::time_point point_started_at{};
     bool point_timing_active{};
     std::uint32_t point_load_polls{};
+    // 点位结果日志：每个点位离开时汇总一条，回答「这个点到底怎么了」。
+    // outcome 用 picked/skipped 计数的前后差推断，不必在每个分支单独标记。
+    bool point_result_active{};
+    std::string point_row_name;
+    std::uint32_t point_picked_before{};
+    std::uint32_t point_skipped_before{};
+    long long point_wait_ms{-1};
+    bool point_interact_sent{};
+    std::string point_finish{"none"};
+    const char* point_actor{"none"};
     // 上一个点位的坐标：用来在耗时日志里带上「从上一个点跳到这里的距离」，
     // 以便直接验证「跳得越近等得越少」这个前提。
     double last_point_x{};
@@ -582,7 +592,12 @@ bool ShopRescanBudgetSpent(Context& context) noexcept {
     return false;
 }
 
+// 点位离开时的汇总日志。定义在 LogPointTiming 之后，ResetPointState 先用到它。
+void LogPointResult(Context& context) noexcept;
+
 void ResetPointState(Context& context) noexcept {
+    // 离开点位：先把这一点的结果写进日志，再清状态。
+    LogPointResult(context);
     context.teleported = false;
     context.moving = false;
     context.interacted = false;
@@ -2888,6 +2903,11 @@ void Begin(Context& context) {
     context.food_empty_group.clear();
     context.food_empty_run = 0;
     context.food_skip_logged.clear();
+    context.point_result_active = false;
+    context.point_wait_ms = -1;
+    context.point_interact_sent = false;
+    context.point_finish = "none";
+    context.point_actor = "none";
     context.skipped = 0;
     context.running = true;
     ResetPointState(context);
@@ -3616,6 +3636,7 @@ void LogPointTiming(Context& context, const Point& p,
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - context.point_started_at).count();
     context.point_timing_active = false;
+    context.point_wait_ms = elapsed_ms;
     const long long jump_cm = context.has_last_point
         ? static_cast<long long>(std::sqrt(
               PlanarDistanceSquared(context.last_point_x, context.last_point_y, p.x, p.y)))
@@ -3636,6 +3657,51 @@ void LogPointTiming(Context& context, const Point& p,
     LogBox(context, message);
 }
 
+// 每个点位离开时汇总一条：结果、等 actor 花了多久、交互有没有发出去、
+// 验证时看到的是「状态字节变没变」和「actor 还在不在」。
+// 单食物的成功判据是「bInteractFinish 变了 且 actor 从对象表消失」，
+// 这两项分开记，才能区分「交互根本没生效」和「生效了但箱子没销毁」。
+void LogPointResult(Context& context) noexcept {
+    if (!context.point_result_active) return;
+    context.point_result_active = false;
+    try {
+        const char* outcome = "aborted";
+        if (context.picked > context.point_picked_before) {
+            outcome = "picked";
+        } else if (context.skipped > context.point_skipped_before) {
+            outcome = "skipped";
+        }
+        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - context.point_started_at).count();
+        std::string message = "point-result point=" + context.point_row_name;
+        message += " result=";
+        message += outcome;
+        message += " wait_ms=";
+        message += std::to_string(context.point_wait_ms);
+        message += " polls=";
+        message += std::to_string(context.point_load_polls);
+        message += " interact=";
+        message += context.point_interact_sent ? "1" : "0";
+        message += " finish=";
+        message += context.point_finish;
+        message += " actor=";
+        message += context.point_actor;
+        message += " total_ms=";
+        message += std::to_string(total_ms);
+        LogBox(context, message);
+    } catch (...) {
+    }
+}
+
+// 拾取服务的快照计数压成短标签，写进 point-result 的 finish 字段。
+// n=nearby t=triggered c=confirmed u=unconfirmed，四个都为 0 就是「附近压根没东西」。
+std::string PickupSnapshotTag(const AnomalyNtePickupSnapshotV1& snapshot) {
+    return "n" + std::to_string(snapshot.nearby) + "t" +
+           std::to_string(snapshot.triggered) + "c" +
+           std::to_string(snapshot.confirmed) + "u" +
+           std::to_string(snapshot.unconfirmed);
+}
+
 void TickFoodPickup(Context& context, const Point& p,
                     const std::chrono::steady_clock::time_point now) {
     // 点位计时从这里开始：第一次进入该点时开始，之后同一轮重试不重置，直到 actor 出现或放弃。
@@ -3643,6 +3709,18 @@ void TickFoodPickup(Context& context, const Point& p,
         context.point_started_at = now;
         context.point_timing_active = true;
         context.point_load_polls = 0;
+    }
+    // 点位结果日志的起点。只在第一次进入该点时初始化；同一轮重试不重置，
+    // 这样 total_ms 才是「这个点位从头到尾花了多久」。
+    if (!context.point_result_active) {
+        context.point_result_active = true;
+        context.point_row_name = p.row_name;
+        context.point_picked_before = static_cast<std::uint32_t>(context.picked);
+        context.point_skipped_before = static_cast<std::uint32_t>(context.skipped);
+        context.point_wait_ms = -1;
+        context.point_interact_sent = false;
+        context.point_finish = "none";
+        context.point_actor = "none";
     }
     if (context.target_actor == 0) {
         context.target_actor =
@@ -3930,6 +4008,7 @@ void TickFoodPickup(Context& context, const Point& p,
             }
             context.pickup_baseline_sequence = baseline.sequence;
             context.pickup_started = true;
+            context.point_interact_sent = true;
             context.pickup_deadline =
                 now + std::chrono::milliseconds(
                           static_cast<long long>(kPickupTimeoutSeconds * 1000.0));
@@ -3947,6 +4026,9 @@ void TickFoodPickup(Context& context, const Point& p,
             snapshot.sequence > context.pickup_baseline_sequence &&
             snapshot.state == ANOMALY_NTE_PICKUP_V1_COMPLETE) {
             if (snapshot.confirmed > 0) {
+                context.point_finish = "confirmed-" + PickupSnapshotTag(snapshot);
+                context.point_actor =
+                    IsObjectInGObjects(context, context.target_actor) ? "alive" : "gone";
                 NoteFoodPointFound(context, p.row_name);
                 ++context.picked;
                 ++context.current_index;
@@ -3959,6 +4041,9 @@ void TickFoodPickup(Context& context, const Point& p,
             }
             if (snapshot.nearby == 0 && snapshot.triggered == 0 &&
                 snapshot.confirmed == 0 && snapshot.unconfirmed == 0) {
+                context.point_finish = "nothing-" + PickupSnapshotTag(snapshot);
+                context.point_actor =
+                    IsObjectInGObjects(context, context.target_actor) ? "alive" : "gone";
                 if (context.pickup_retries < kPickupMaximumRetries) {
                     ++context.pickup_retries;
                     context.pickup_started = false;
@@ -4027,6 +4112,9 @@ void TickFoodPickup(Context& context, const Point& p,
                     "status.nothing_picked_skip", "Nothing picked, skip {0}", nothing_skip_args);
                 return;
             }
+            context.point_finish = "unconfirmed-" + PickupSnapshotTag(snapshot);
+            context.point_actor =
+                IsObjectInGObjects(context, context.target_actor) ? "alive" : "gone";
             if (context.pickup_retries < kPickupMaximumRetries) {
                 ++context.pickup_retries;
                 context.pickup_started = false;
@@ -4061,6 +4149,12 @@ void TickFoodPickup(Context& context, const Point& p,
             return;
         }
         if (now >= context.pickup_deadline) {
+            if (context.point_finish == "none") {
+                // 快照一直没给出结论：记成 timeout，和「有结果但没确认」区分开。
+                context.point_finish = "timeout";
+                context.point_actor =
+                    IsObjectInGObjects(context, context.target_actor) ? "alive" : "gone";
+            }
             if (context.teleport_retry == 0) {
                 context.teleport_retry = 1;
                 context.teleported = false;
@@ -5015,6 +5109,7 @@ void Tick(Context& context) {
                      reinterpret_cast<void*>(context.server_interact_fn), params);
         if (triggered) {
             context.interacted = true;
+            context.point_interact_sent = true;
             if (p.category == "shop_steal") {
                             // 记下成功时的 actor 地址：与失败时的地址对照，判断插件是不是一直握着
                             // 旧的（已被拿走的）实例，而刷新出来的货是另一个新实例。
@@ -5268,6 +5363,8 @@ void Tick(Context& context) {
              context.target_actor + InteractFinishOffset(context, context.target_actor)),
          current_finish);
     if (current_finish == context.interact_baseline) {
+        context.point_finish = "unchanged";
+        context.point_actor = "alive";
         if (context.teleport_retry == 0) {
             context.teleport_retry = 1;
             context.teleported = false;
@@ -5294,6 +5391,8 @@ void Tick(Context& context) {
     } else {
         const bool still_alive =
             IsObjectInGObjects(context, context.target_actor);
+        context.point_finish = "changed";
+        context.point_actor = still_alive ? "alive" : "gone";
         if (still_alive) {
             if (context.teleport_retry == 0) {
                 context.teleport_retry = 1;
