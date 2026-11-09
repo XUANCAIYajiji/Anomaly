@@ -1759,6 +1759,10 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points,
             p.row_name.push_back('_');
             p.row_name += std::to_string(row_id.number - 1U);
         }
+        // 剧情点位（Item|E06_066_1_5_MainStory 这类）只在剧情状态到位时才刷出可拾取物：
+        // 实测一个点跑满 8 轮轮询、烧了 193 秒零产出。它的 key 也不匹配任何区域配额，
+        // 永远判不了死，所以每轮都要白跑一遍。直接从待跑表里剔除。
+        if (p.row_name.find("MainStory") != std::string::npos) continue;
         if (category == "shop_steal" && IsExcludedShopPoint(p.row_name)) continue;
         p.x = x;
         p.y = y;
