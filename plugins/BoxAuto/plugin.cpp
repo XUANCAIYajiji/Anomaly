@@ -6270,6 +6270,6 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         anomaly::sdk::StringView("ccyellowstar.box-auto"),
         anomaly::sdk::StringView("Resource Auto Pickup"),
         anomaly::sdk::StringView("CCYellowStar"),
-        anomaly::sdk::StringView("0.3.7"), Load, Start, Stop, Unload, Update, Draw};
+        anomaly::sdk::StringView("0.1.16"), Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }
