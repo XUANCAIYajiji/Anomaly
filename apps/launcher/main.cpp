@@ -4,9 +4,13 @@
 #include "anomaly/launcher/mod_groups.hpp"
 #include "anomaly/launcher/configuration.hpp"
 #include "anomaly/launcher/proxy_installation.hpp"
+#include "anomaly/launcher/release_update.hpp"
 #include "anomaly/i18n.hpp"
+#include "anomaly/platform_notice.hpp"
+#include "anomaly/sdk/version.h"
 #include "anomaly/platform_ui_layout.hpp"
 #include "anomaly/platform_ui_theme.hpp"
+#include "anomaly/telemetry.hpp"
 #include "anomaly/runtime_launch.hpp"
 #include "anomaly/reliable_storage.hpp"
 #include "anomaly/pak_mod_settings.hpp"
@@ -16,6 +20,7 @@
 #include "anomaly/plugin_package.hpp"
 #include "anomaly/ui_resource_decoder.hpp"
 #include "config.hpp"
+#include "mod_list.hpp"
 
 #include <Windows.h>
 #include <nlohmann/json.hpp>
@@ -75,7 +80,22 @@ using Microsoft::WRL::ComPtr;
 
 constexpr int kLogoResourceId = 101;
 constexpr int kModPlaceholderResourceId = 102;
+// The support buttons. They are pictures rather than drawn controls because they are the platforms'
+// own artwork, and they are embedded rather than fetched so the buttons work on a machine that never
+// reaches the networks those pages live on.
+constexpr int kSponsorResourceId = 103;
+constexpr int kKofiResourceId = 104;
 constexpr int kIconResourceId = 201;
+// Where the support buttons point. Data, not copy -- a translated address leads nowhere.
+constexpr std::wstring_view kSponsorUrl{L"https://afdian.com/a/bananachicken"};
+constexpr std::wstring_view kKofiUrl{L"https://ko-fi.com/bananachicken"};
+// Where the project itself answers. The about section at the foot of the settings page offers these
+// two, so the addresses live here with the other links rather than inside the drawing code.
+constexpr std::string_view kRepositoryUrl{"https://github.com/AnomalyNTE/Anomaly"};
+constexpr std::string_view kDiscordUrl{"https://discord.gg/tfeh8QQ9Vy"};
+// The width each support button is drawn at, in canvas pixels before the DPI scale. It is the width
+// the platforms publish their artwork for.
+constexpr float kSupportButtonWidth = 200.0f;
 // Sized for the launcher's 17px font. These were laid out for 13px text, and a
 // child that cannot fit its own contents grows a scrollbar instead of clipping,
 // which is what a mode row of 48px did to a 30px button plus its padding.
@@ -102,7 +122,17 @@ constexpr float kLauncherCanvasHeight = 860.0f;
 // Six more pixels keep that top edge off the window border, where a cut sticker looks clipped.
 constexpr float kLauncherBandTop = 69.3f;
 constexpr float kModeHeight = 76.0f;
+// The lower command row both launch sub-modes anchor their own buttons to: this far above the page's
+// bottom edge, and this tall. The sponsor button shares that line, which is why the two numbers live
+// here rather than in each of the three places that place something on it.
+constexpr float kLaunchActionRowBottom = 82.0f;
+constexpr float kLaunchActionRowHeight = 62.0f;
 constexpr float kProxyActionLeftPadding = 4.0f;
+// The band's "a newer release exists" chip is drawn on the modes row, which is a child window of the
+// root, while the update dialog belongs to the root. The chip therefore leaves a request here and the
+// dialog takes it: the answer to "do you want to update" is the same dialog the check opens, wherever
+// the user asked for it from.
+bool g_update_prompt_requested{};
 constexpr float kLauncherFontScale = 20.0f / 13.0f;
 constexpr float kDefaultDpi = 96.0f;
 
@@ -142,6 +172,66 @@ ImVec4 LauncherMutedInk() noexcept {
 
 enum class LauncherMode : std::uint8_t { Launch, Mods, Settings };
 enum class MessageKind : std::uint8_t { Neutral, Success, Error };
+
+// The state of the launcher's own update, as the settings page reports it. The phases are the
+// steps the update actually takes, so the page can only ever show a step that happened.
+enum class LauncherUpdatePhase : std::uint8_t {
+    Idle,
+    Checking,
+    UpToDate,
+    Available,
+    Downloading,
+    Installing,
+    Installed,
+    Failed,
+};
+
+// What a failed update step was. The launcher names the ones it can explain -- an unreachable host,
+// a rate-limited API -- and leaves the rest to the installer, whose diagnostic says what could not
+// be written.
+enum class LauncherUpdateFailure : std::uint8_t {
+    None,
+    Network,
+    RateLimited,
+    Http,
+    NotRelease,
+    Check,
+    Install,
+};
+
+// What the last check found and, once it is asked for, how far the update got. Everything here is
+// read from the snapshot; the phase is the only field the page branches on.
+struct LauncherUpdateStatus final {
+    LauncherUpdatePhase phase{LauncherUpdatePhase::Idle};
+    bool auto_check{true};
+    // The release the user answered "skip this version" to: the check keeps reporting it, but the
+    // launcher does not ask about that one version again.
+    std::string skipped_version;
+    std::string remote_tag;
+    std::string remote_version;
+    std::string page_url;
+    // The package the check chose: its address, its published length and its published digest, which
+    // is what a download is verified against before anything is extracted.
+    anomaly::launcher::ReleaseAsset asset;
+    // The release notes the dialog shows before the user decides.
+    std::string notes;
+    LauncherUpdateFailure failure{LauncherUpdateFailure::None};
+    // The HTTP status of a failed lookup, and the diagnostic a failed install reported.
+    int http_status{};
+    std::string detail;
+
+    [[nodiscard]] bool Busy() const noexcept {
+        return phase == LauncherUpdatePhase::Checking ||
+            phase == LauncherUpdatePhase::Downloading ||
+            phase == LauncherUpdatePhase::Installing;
+    }
+
+    [[nodiscard]] bool CanInstall() const noexcept {
+        return !asset.download_url.empty() &&
+            (phase == LauncherUpdatePhase::Available ||
+             (phase == LauncherUpdatePhase::Failed && failure == LauncherUpdateFailure::Install));
+    }
+};
 
 // One decoded theme image. The worker decodes and the render thread only
 // uploads, so a large background never stalls on WIC during a frame.
@@ -214,6 +304,10 @@ struct LauncherSnapshot final {
     LauncherMessage message;
     MessageKind message_kind{MessageKind::Neutral};
     MessageScope message_scope{MessageScope::Both};
+    LauncherUpdateStatus update;
+    // Set once the new image is in place and has been started: the window is done, because it is
+    // drawn by the image that was replaced.
+    bool restart_pending{};
     std::shared_ptr<const LauncherTheme> theme;
 };
 
@@ -319,9 +413,10 @@ std::filesystem::path ExecutableDirectory() {
     return ExecutablePath().parent_path();
 }
 
-// The hook that goes into the official launcher. It is built with this executable and ships in the
-// runtime payload directory. The path is absolute because the launcher it is injected into runs from
-// an install location this process does not own.
+// The hook that goes into the official launcher. Its source still lives in this tree
+// (src/launcher/hook/nte_game_hook.cpp) but nothing builds or ships it, so the file is absent from an
+// installed package. The path is absolute because the launcher it is injected into runs from an
+// install location this process does not own.
 std::filesystem::path GameHookLibrary() {
     return ExecutableDirectory() / L"Anomaly" / L"NTEGameHook.dll";
 }
@@ -329,8 +424,8 @@ std::filesystem::path GameHookLibrary() {
 // Auto-starting the official client is off. The launcher is started the way its own shortcut starts
 // it, and the player presses start game in the window that opens, so capture waits for the HTGame.exe
 // that press produces. Everything auto-starting needs -- resolving the client out of the bootstrap's
-// update section, injecting the hook, and the hook itself -- is kept behind this switch, still
-// compiled and still shipped, so turning it back on is this one line.
+// update section and injecting the hook -- stays compiled behind this switch, but the hook library is
+// no longer built or shipped, so turning it back on also means building it again.
 constexpr bool kAutoStartOfficialClient = false;
 
 struct AdministratorLaunchResult final {
@@ -487,9 +582,9 @@ std::string Ellipsize(std::string_view value, float width) {
 
 // Every icon the launcher draws, and therefore the whole icon font it bakes. A glyph
 // that is not in this list cannot be drawn, so adding one here is what makes it
-// available as well as visible.
-constexpr std::array<char32_t, 8> kLauncherIcons{
-    0xe838, 0xe72c, 0xe768, 0xe73e, 0xe7ba, 0xe711, 0xe8b7, 0xe8e5};
+// available as well as visible. 0xeb9f is the picture mark a card without a cover wears.
+constexpr std::array<char32_t, 9> kLauncherIcons{
+    0xe838, 0xe72c, 0xe768, 0xe73e, 0xe7ba, 0xe711, 0xe8b7, 0xe8e5, 0xeb9f};
 
 // The launcher draws its body text at this multiple of the platform base size and its
 // title with an explicit size from the same font, so one bake serves every string on
@@ -538,6 +633,55 @@ anomaly::MessageId ProxyStateMessageId(
     return anomaly::MessageId::LauncherProxyStateUnavailable;
 }
 
+std::filesystem::path LauncherModsDirectory(const LauncherSnapshot& snapshot);
+
+// The launcher's network helpers live with the GameBanana pages further down; the update check on
+// this side of them needs their declarations only. The status code is reported as well as the body
+// because the update check has to tell a rate-limited API answer from a release that is not there.
+struct LauncherDownloadProgress final {
+    std::atomic<long long> bytes{};
+    std::atomic<long long> total{};
+    std::atomic<bool> cancel{};
+};
+
+std::string LauncherHttpGet(const std::wstring& host, const std::wstring& path,
+    bool use_system_proxy = false, int* status_code = nullptr);
+std::string LauncherHttpGetUrl(const std::string& url, bool use_system_proxy = false,
+    int* status_code = nullptr, DWORD timeout_ms = 8000);
+bool LauncherDownloadUrl(const std::string& url, const std::filesystem::path& destination,
+    LauncherDownloadProgress* progress = nullptr);
+void LauncherUpdateLog(const std::string& line);
+
+// The addresses one github.com URL is asked at, best-known first: the mirror that answered last time,
+// then the direct address, then the rest. A launcher started on a network where github.com does not
+// answer would otherwise spend its whole timeout budget on the direct attempt before it ever reaches
+// the mirror that works.
+std::vector<std::string> LauncherLookupCandidates(
+    const std::string& url, const std::string& endpoint) {
+    std::vector<std::string> candidates;
+    candidates.reserve(1 + anomaly::launcher::kGithubProxyPrefixes.size());
+    if (!endpoint.empty()) candidates.push_back(endpoint + url);
+    candidates.push_back(url);
+    for (const auto prefix : anomaly::launcher::kGithubProxyPrefixes) {
+        if (std::string(prefix) != endpoint) candidates.push_back(std::string(prefix) + url);
+    }
+    return candidates;
+}
+
+// Which mirror a URL was asked through: the prefix it starts with, or nothing for the direct address.
+std::string LauncherEndpointOfUrl(const std::string& url) {
+    for (const auto prefix : anomaly::launcher::kGithubProxyPrefixes) {
+        if (url.starts_with(prefix)) return std::string(prefix);
+    }
+    return {};
+}
+
+
+
+// Mod installs and launcher updates run on different workers and may overlap.
+LauncherDownloadProgress g_mod_download;
+LauncherDownloadProgress g_update_download;
+
 class LauncherController final {
 public:
     explicit LauncherController(std::filesystem::path payload_root)
@@ -551,9 +695,16 @@ public:
     }
 
     ~LauncherController() {
+        g_update_download.cancel.store(true);
+        update_check_worker_.request_stop();
         worker_.request_stop();
         queue_changed_.notify_all();
+        if (update_check_worker_.joinable()) update_check_worker_.join();
         worker_.join();
+        if (telemetry_worker_.joinable()) {
+            telemetry_worker_.request_stop();
+            telemetry_worker_.join();
+        }
         // Closing the window may cancel a queued preference write. Once initialization completed,
         // persist the final in-memory configuration after the worker has stopped.
         if (state_.theme != nullptr) static_cast<void>(PersistConfigurationImpl());
@@ -596,6 +747,7 @@ public:
 
     void InstallProxy() {
         Queue(anomaly::MessageId::LauncherStatusInstallingRuntime, MessageScope::Proxy, [this] {
+            StartTelemetryImpl();
             const auto game = GameDirectory();
             const auto result = anomaly::launcher::InstallProxyRuntime(game, source_);
             PublishProxy(result);
@@ -616,6 +768,7 @@ public:
 
     void UninstallProxy() {
         Queue(anomaly::MessageId::LauncherStatusUninstallingProxy, MessageScope::Proxy, [this] {
+            StartTelemetryImpl();
             const auto result = anomaly::launcher::UninstallProxy(GameDirectory(), source_);
             PublishProxy(result);
             RefreshProcessesImpl(ProcessAnnounce::Never);
@@ -699,12 +852,14 @@ public:
 
     void LaunchAndAttach() {
         Queue(anomaly::MessageId::LauncherStatusLaunchingAttach, MessageScope::Attach, [this] {
+            StartTelemetryImpl();
             const auto launcher = LauncherExecutable();
             const auto selected = ResolveAttachRuntime();
             if (!selected.Ok()) {
                 PublishRuntimeFailure(selected);
                 return;
             }
+            anomaly::DisableRestrictedPakMods(LauncherModsDirectory(Snapshot()));
             anomaly::launcher::ManualMapLaunchOptions options;
             // NTELauncher.exe is what the player's own shortcut starts: it opens the launcher window,
             // and the press of its start button is what creates HTGame.exe.
@@ -762,6 +917,7 @@ public:
         if (process_id == 0) return;
         Queue(anomaly::MessageId::LauncherStatusInjectingProcess, MessageScope::Attach,
             [this, process_id] {
+            StartTelemetryImpl();
             const auto selected = ResolveAttachRuntime();
             if (!selected.Ok()) {
                 PublishRuntimeFailure(selected);
@@ -891,6 +1047,58 @@ public:
         }
     }
 
+    // The launcher's own update. "Check" is the read of the newest release and its comparison with
+    // this build; "install" downloads that release's runtime package, publishes it over this
+    // installation and starts the new image. Both run on the worker: neither may block a frame.
+    // AutoCheckUpdates is what the window calls every frame, and it decides for itself whether this
+    // launch still owes a check.
+    void SetAutoCheckUpdates(const bool enabled) {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (configuration_.update.auto_check == enabled) return;
+            configuration_.update.auto_check = enabled;
+            state_.update.auto_check = enabled;
+            settings_dirty_ = true;
+        }
+    }
+
+    // "Skip this version": the release stays known and installable from the settings page, but the
+    // prompt stops asking about it, this session and every later one.
+    void SkipUpdateVersion(std::string version) {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (version.empty() || configuration_.update.skipped_version == version) return;
+            configuration_.update.skipped_version = std::move(version);
+            state_.update.skipped_version = configuration_.update.skipped_version;
+            settings_dirty_ = true;
+        }
+    }
+
+    void AutoCheckUpdates() {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (auto_check_done_ || state_.busy || !configuration_.update.auto_check) return;
+            auto_check_done_ = true;
+        }
+        if (!StartUpdateCheck()) {
+            std::scoped_lock lock(state_mutex_);
+            auto_check_done_ = false;  // the worker was busy; the next frame tries again
+        }
+    }
+
+    void CheckForUpdates() {
+        StartUpdateCheck();
+    }
+
+    void InstallUpdate() {
+        const auto snapshot = Snapshot();
+        if (snapshot.busy || !snapshot.update.CanInstall()) return;
+        g_update_download.cancel.store(false);
+        g_update_download.bytes.store(0);
+        g_update_download.total.store(0);
+        QueueUpdate([this] { InstallUpdateImpl(); }, LauncherUpdateFailure::Install);
+    }
+
     // The mods page and the download page own no configuration of their own: their view
     // choices are stored here and read back through the snapshot, which is what keeps the
     // settings page and the pages in step. The write itself is deferred to FlushSettings.
@@ -944,6 +1152,39 @@ public:
 private:
     using Work = std::function<void()>;
 
+    bool StartUpdateCheck() {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (state_.busy || state_.update.Busy()) return false;
+            state_.update.phase = LauncherUpdatePhase::Checking;
+            auto_check_done_ = true;
+        }
+        // A release lookup must not reserve the launch/install worker for every network timeout.
+        // The previous lookup has published its result before another check becomes available.
+        if (update_check_worker_.joinable()) update_check_worker_.join();
+        update_check_worker_ = std::jthread([this](std::stop_token stop) {
+            RunUpdate([this, stop] { CheckForUpdatesImpl(stop); }, LauncherUpdateFailure::Check);
+        });
+        return true;
+    }
+
+    bool QueueUpdate(Work work, LauncherUpdateFailure failure) {
+        return QueueSilent([this, work = std::move(work), failure] {
+            RunUpdate(work, failure);
+        });
+    }
+
+    void RunUpdate(const Work& work, LauncherUpdateFailure failure) {
+        try {
+            work();
+        } catch (...) {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Failed;
+            state_.update.failure = failure;
+            state_.update.detail = "update operation could not be completed";
+        }
+    }
+
     [[nodiscard]] anomaly::RuntimeLaunchResult ResolveAttachRuntime() const {
         auto bundled = anomaly::ResolveRuntimeLaunch({source_.runtime_directory});
         if (bundled.Ok()) return bundled;
@@ -977,21 +1218,48 @@ private:
         return state_.launcher_executable;
     }
 
-    [[nodiscard]] std::filesystem::path RuntimeSettingsRoot() const {
-        const auto game_directory = GameDirectory();
-        if (!game_directory.empty()) {
+    // Which runtime the game ends up loading depends on the mode: a proxy installation keeps its
+    // runtime inside the game folder, while the core this launcher maps itself runs from the
+    // bundled payload. Both read their own anomaly.ini, so both have to carry the startup hotkey --
+    // writing only the installed one left an attached game toggling on the payload's shipped
+    // default, and writing only the payload one left a proxy-installed game on its old key.
+    // The installed runtime comes first because that is the file the row reads back from.
+    [[nodiscard]] std::vector<std::filesystem::path> RuntimeSettingsRoots() const {
+        std::vector<std::filesystem::path> roots;
+        std::vector<std::filesystem::path> game_directories;
+        {
+            std::scoped_lock lock(state_mutex_);
+            game_directories.push_back(state_.game_directory);
+            game_directories.push_back(
+                configuration_.selected_client == anomaly::launcher::NteClient::Global
+                    ? configuration_.mainland_china.game_directory
+                    : configuration_.global.game_directory);
+        }
+        const auto add = [&roots](const std::filesystem::path& root) {
+            std::error_code error;
+            if (root.empty() || !std::filesystem::is_directory(root, error) || error) return;
+            if (std::find(roots.begin(), roots.end(), root) == roots.end()) roots.push_back(root);
+        };
+        for (const auto& game_directory : game_directories) {
+            if (game_directory.empty()) continue;
             const auto installed = game_directory / L"Anomaly";
             std::error_code error;
+            // Only an installation the game folder really holds: creating the runtime directory
+            // from a settings write would make an empty one look installed.
             if (std::filesystem::is_regular_file(
                     installed / L"Anomaly.Core.dll", error) && !error) {
-                return installed;
+                add(installed);
             }
         }
-        return source_.runtime_directory;
+        // The launcher's own runtime last: a manual map starts the core from here, and this ini is
+        // the file the launcher itself reads at start-up.
+        add(source_.runtime_directory);
+        return roots;
     }
 
     void RefreshHotkeyImpl() {
-        const auto root = RuntimeSettingsRoot();
+        const auto roots = RuntimeSettingsRoots();
+        const auto root = roots.empty() ? source_.runtime_directory : roots.front();
         const auto config = ue5mem::AnalyzerConfig::Load(root / L"anomaly.ini");
         std::scoped_lock lock(state_mutex_);
         state_.toggle_key = config.platform_toggle_key;
@@ -999,9 +1267,17 @@ private:
 
     [[nodiscard]] bool SaveToggleKeyImpl(const std::uint32_t key) const {
         const std::wstring value = std::to_wstring(key);
-        return WritePrivateProfileStringW(
-            L"Platform", L"ToggleKey", value.c_str(),
-            (RuntimeSettingsRoot() / L"anomaly.ini").c_str()) != FALSE;
+        const auto roots = RuntimeSettingsRoots();
+        // Nothing written is not a saved preference, so an empty list starts out failed instead of
+        // reporting a success the game never sees.
+        bool saved = !roots.empty();
+        for (const auto& root : roots) {
+            const bool written = WritePrivateProfileStringW(
+                L"Platform", L"ToggleKey", value.c_str(),
+                (root / L"anomaly.ini").c_str()) != FALSE;
+            saved = written && saved;
+        }
+        return saved;
     }
 
     // The launcher's own ini, which is the file this process reads at start-up. The runtime's
@@ -1168,8 +1444,13 @@ private:
             state_.view = configuration_.view;
             state_.artwork = configuration_.artwork;
             state_.custom_colors = configuration_.custom_colors;
+            state_.update.auto_check = configuration_.update.auto_check;
+            state_.update.skipped_version = configuration_.update.skipped_version;
         }
         const auto saved = PersistConfigurationImpl();
+        // A previous update left the image it replaced behind, which this process can now delete:
+        // while that image was running it could only be renamed.
+        anomaly::launcher::RemoveUpdateLeftovers(payload_root_);
         RefreshHotkeyImpl();
         RefreshProxyImpl();
         RefreshProcessesImpl();
@@ -1224,6 +1505,27 @@ private:
             configuration_path_, configuration);
     }
 
+    void StartTelemetryImpl() noexcept {
+        try {
+            const auto day = anomaly::TelemetryDay(std::chrono::system_clock::now());
+            if (telemetry_attempt_day_ == day) return;
+            anomaly::TelemetryOptions options;
+            options.enabled = ue5mem::AnalyzerConfig::Load(LauncherSettingsPath()).telemetry_enabled;
+            if (!options.enabled) return;
+            const auto snapshot = Snapshot();
+            if (!snapshot.theme) return;
+            options.language = anomaly::LocaleName(anomaly::ResolveUserLocale(
+                anomaly::ParseLanguagePreference(snapshot.language).preference).locale);
+            anomaly::LauncherTelemetryUsage usage;
+            usage.theme = anomaly::ToString(snapshot.theme->palette);
+            usage.custom_background = anomaly::launcher::IsCustomLauncherBackground(
+                snapshot.theme->palette, snapshot.theme->layout.background.path, snapshot.theme->HasBackground());
+            telemetry_attempt_day_ = day;
+            telemetry_worker_ = std::jthread([options = std::move(options), usage = std::move(usage)](
+                std::stop_token stop) { anomaly::ReportLauncherUsage(options, usage, stop); });
+        } catch (...) {}
+    }
+
     void RefreshThemeImpl() {
         // The launcher reads the theme next to itself, exactly like its locales:
         // payload_root_ points at wherever the payload is installed, which is not
@@ -1243,6 +1545,246 @@ private:
         ++theme_version_;
         std::scoped_lock lock(state_mutex_);
         state_.theme = std::move(theme);
+    }
+
+    // GET /repos/<repository>/releases/latest, asked at the endpoint that answered last before any
+    // other: the answer is the same JSON wherever it comes from, so the first endpoint that returns a
+    // release ends the search and is remembered for the next launch. The status the API itself
+    // reported is what a failure is described with, because that is the one that says "rate limited".
+    void CheckForUpdatesImpl(std::stop_token stop) {
+        // The mirror that answered last time, if any: asked first, so a launch on a network that
+        // cannot reach api.github.com does not spend its budget on an address known not to answer.
+        std::string endpoint;
+        {
+            std::scoped_lock lock(state_mutex_);
+            endpoint = configuration_.update.endpoint;
+            state_.update.phase = LauncherUpdatePhase::Checking;
+            state_.update.failure = LauncherUpdateFailure::None;
+            state_.update.detail.clear();
+            state_.update.http_status = 0;
+        }
+        const std::string api_url = "https://api.github.com/repos/" +
+            std::string(anomaly::launcher::kReleaseRepository) + "/releases/latest";
+        std::optional<anomaly::launcher::ReleaseInfo> release;
+        std::string answered_by;
+        int status{};
+        bool answered{};
+        bool first = true;
+        for (const std::string& url : LauncherLookupCandidates(api_url, endpoint)) {
+            if (stop.stop_requested()) return;
+            // The first endpoint gets both routes -- the system proxy the machine is configured with,
+            // and a direct connection -- because a stale proxy is a common reason for a lookup to
+            // return nothing. The rest are tried once: whoever answers, answers.
+            int attempt_status{};
+            std::string body = LauncherHttpGetUrl(url, false, &attempt_status, 3000);
+            if (body.empty() && first && !stop.stop_requested())
+                body = LauncherHttpGetUrl(url, true, &attempt_status, 3000);
+            first = false;
+            if (attempt_status != 0) status = attempt_status;
+            if (body.empty()) continue;
+            answered = true;
+            if (auto parsed = anomaly::launcher::ParseLatestRelease(body); parsed.has_value()) {
+                release = std::move(parsed);
+                answered_by = url;
+                break;
+            }
+        }
+
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (release.has_value() && !answered_by.empty()) {
+                // Remember which endpoint answered, so the next launch starts there instead of
+                // waiting out the addresses this network cannot reach.
+                const std::string used = LauncherEndpointOfUrl(answered_by);
+                if (configuration_.update.endpoint != used) {
+                    configuration_.update.endpoint = used;
+                    settings_dirty_ = true;
+                }
+            }
+            state_.update.http_status = status;
+            if (!release.has_value()) {
+                state_.update.phase = LauncherUpdatePhase::Failed;
+                if (status == 0 && !answered) {
+                    state_.update.failure = LauncherUpdateFailure::Network;
+                } else if (status == 403 || status == 429) {
+                    state_.update.failure = LauncherUpdateFailure::RateLimited;
+                } else if (status != 0 && status != 200) {
+                    state_.update.failure = LauncherUpdateFailure::Http;
+                } else {
+                    state_.update.failure = LauncherUpdateFailure::NotRelease;
+                }
+                return;
+            }
+            state_.update.remote_tag = release->tag;
+            state_.update.remote_version = release->version;
+            state_.update.page_url = release->page_url;
+            state_.update.notes = release->notes;
+            const auto* const asset = anomaly::launcher::FindRuntimeAsset(*release);
+            state_.update.asset = asset != nullptr
+                ? *asset : anomaly::launcher::ReleaseAsset{};
+            switch (anomaly::launcher::CompareRelease(ANOMALY_SDK_VERSION_STRING, *release)) {
+            case anomaly::launcher::ReleaseComparison::Newer:
+                if (asset != nullptr) {
+                    state_.update.phase = LauncherUpdatePhase::Available;
+                } else {
+                    state_.update.phase = LauncherUpdatePhase::Failed;
+                    state_.update.failure = LauncherUpdateFailure::Check;
+                    state_.update.detail = "release publishes no verified runtime package for this version";
+                }
+                break;
+            case anomaly::launcher::ReleaseComparison::UpToDate:
+                state_.update.phase = LauncherUpdatePhase::UpToDate;
+                break;
+            case anomaly::launcher::ReleaseComparison::Unknown:
+                state_.update.phase = LauncherUpdatePhase::Failed;
+                state_.update.failure = LauncherUpdateFailure::Check;
+                state_.update.detail = "release version could not be compared with this build";
+                break;
+            }
+        }
+    }
+
+    // Downloads the runtime package the check found and publishes it over this installation. The
+    // download goes to a directory of its own: two updates never share a half-written archive, and
+    // the archive itself is thrown away as soon as it is extracted. The package comes from the
+    // release's own address and is verified against the length and digest the release published,
+    // because a truncated transfer or someone else's bytes must not reach an extraction.
+    void InstallUpdateImpl() {
+        anomaly::launcher::ReleaseAsset asset;
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (!state_.update.CanInstall()) return;
+            asset = state_.update.asset;
+            if (asset.download_url.empty()) return;
+            state_.update.phase = LauncherUpdatePhase::Downloading;
+            state_.update.failure = LauncherUpdateFailure::None;
+            state_.update.detail.clear();
+        }
+        const auto fail = [this](std::string detail) {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Failed;
+            state_.update.failure = LauncherUpdateFailure::Install;
+            state_.update.detail = std::move(detail);
+        };
+        std::error_code error;
+        GUID download_id{};
+        wchar_t download_name[40]{};
+        if (FAILED(CoCreateGuid(&download_id)) ||
+            StringFromGUID2(download_id, download_name, static_cast<int>(std::size(download_name))) == 0) {
+            fail("update download directory could not be allocated");
+            return;
+        }
+        const auto directory = std::filesystem::temp_directory_path(error) /
+            (std::wstring(L"anomaly-launcher-update-") + download_name);
+        if (error) {
+            fail("temporary directory is unavailable");
+            return;
+        }
+        if (!std::filesystem::create_directory(directory, error)) {
+            fail("update download directory could not be created");
+            return;
+        }
+        struct DownloadDirectory final {
+            std::filesystem::path path;
+            ~DownloadDirectory() {
+                std::error_code ignored;
+                std::filesystem::remove_all(path, ignored);
+            }
+        } cleanup{directory};
+        const auto archive = directory / L"runtime.zip";
+
+        // The package is fetched from the release's own address, once: the gh-proxy mirrors exist to
+        // reach the API when github.com does not answer, not to carry the payload, and a package that
+        // arrived through a third party would be one more thing to trust. A user whose network cannot
+        // reach github.com at all has the netdisk buttons in this dialog for exactly that case.
+        anomaly::launcher::PackageVerification verification;
+        std::string rejected;
+        bool downloaded = LauncherDownloadUrl(asset.download_url, archive, &g_update_download);
+        if (downloaded) {
+            verification = anomaly::launcher::VerifyReleasePackage(archive, asset);
+            if (!verification.Ok()) {
+                rejected = std::string("package failed verification (") +
+                    (verification.check == anomaly::launcher::PackageCheck::Size
+                        ? "size " + std::to_string(verification.size) + " != " +
+                            std::to_string(asset.size)
+                        : verification.check == anomaly::launcher::PackageCheck::Digest
+                            ? "sha256 " + verification.sha256
+                            : std::string("unreadable")) + ')';
+                LauncherUpdateLog(rejected);
+                std::filesystem::remove(archive, error);
+                downloaded = false;
+            }
+        } else {
+            LauncherUpdateLog("package download failed: " + asset.download_url);
+        }
+        if (!downloaded || g_update_download.cancel.load()) {
+            if (g_update_download.cancel.load()) {
+                // Cancelling is not a failure: the release is still there to install, and the dialog
+                // goes back to offering it.
+                std::scoped_lock lock(state_mutex_);
+                state_.update.phase = LauncherUpdatePhase::Available;
+                state_.update.failure = LauncherUpdateFailure::None;
+                state_.update.detail.clear();
+                return;
+            }
+            fail(rejected.empty()
+                ? std::string("update package could not be downloaded")
+                : rejected);
+            return;
+        }
+        LauncherUpdateLog("package verified: " + asset.name + " size=" +
+            std::to_string(verification.size) + " sha256=" + verification.sha256);
+        {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Installing;
+        }
+        const auto extracted = anomaly::launcher::ExtractModArchive(archive, &g_update_download.cancel);
+        if (!extracted.Ok()) {
+            if (extracted.error == anomaly::launcher::ModArchiveError::Cancelled) {
+                std::scoped_lock lock(state_mutex_);
+                state_.update.phase = LauncherUpdatePhase::Available;
+                return;
+            }
+            fail("update package could not be extracted");
+            return;
+        }
+        const auto published =
+            anomaly::launcher::PublishStagedRelease(extracted.directory, payload_root_);
+        if (!published.Ok()) {
+            fail(published.failure);
+            return;
+        }
+        std::string restart_failure;
+        if (!RelaunchUpdatedLauncher(restart_failure)) {
+            fail(std::move(restart_failure));
+            return;
+        }
+        std::scoped_lock lock(state_mutex_);
+        state_.update.phase = LauncherUpdatePhase::Installed;
+        state_.restart_pending = true;
+    }
+
+    // The new image is in place, so this process now runs the image that was replaced: it starts
+    // the new one and lets the window close. The child inherits this token, which is what keeps an
+    // elevated launcher elevated without a second prompt.
+    bool RelaunchUpdatedLauncher(std::string& failure) {
+        const auto executable = payload_root_ / anomaly::launcher::kLauncherExecutableName;
+        // Wait before reading configuration or removing the renamed image. The old controller
+        // persists its final settings during destruction, after the window closes.
+        std::wstring command = L"\"" + executable.wstring() + L"\" --wait-for-update " +
+            std::to_wstring(GetCurrentProcessId());
+        STARTUPINFOW startup{.cb = sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        if (CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                CREATE_UNICODE_ENVIRONMENT, nullptr, executable.parent_path().c_str(),
+                &startup, &process) == FALSE) {
+            failure = "new launcher could not be started (Win32 " +
+                std::to_string(GetLastError()) + ')';
+            return false;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return true;
     }
 
     void RefreshProcessesImpl(ProcessAnnounce announce = ProcessAnnounce::Always) {
@@ -1320,11 +1862,16 @@ private:
     // Guarded by state_mutex_, flushed by FlushSettings once the worker is free.
     bool settings_dirty_{};
     bool theme_dirty_{};
+    // Set when this launch has done its automatic update check, whether or not it found anything.
+    bool auto_check_done_{};
     std::mutex queue_mutex_;
     std::condition_variable_any queue_changed_;
     std::deque<Work> queue_;
     // Throttles PollProcesses: a per-frame caller must not turn into a per-frame process scan.
     std::chrono::steady_clock::time_point last_process_poll_{};
+    std::jthread update_check_worker_;
+    std::string telemetry_attempt_day_;
+    std::jthread telemetry_worker_;
     std::jthread worker_;
 };
 
@@ -1346,6 +1893,14 @@ struct Graphics final {
     // drawing is not stretched to whatever shape the slot happens to have.
     std::uint32_t mod_placeholder_width{};
     std::uint32_t mod_placeholder_height{};
+    // The sponsor button's artwork. Its own aspect fills the height the caption gives it, so the
+    // button keeps the proportions the platform publishes it with.
+    ComPtr<ID3D11ShaderResourceView> sponsor;
+    std::uint32_t sponsor_width{};
+    std::uint32_t sponsor_height{};
+    ComPtr<ID3D11ShaderResourceView> kofi;
+    std::uint32_t kofi_width{};
+    std::uint32_t kofi_height{};
     ComPtr<ID3D11ShaderResourceView> theme_background;
     std::uint32_t theme_background_width{};
     std::uint32_t theme_background_height{};
@@ -2192,6 +2747,27 @@ void DrawModes(
             ? anomaly::launcher::NteClient::Global
             : anomaly::launcher::NteClient::MainlandChina);
     }
+    // A release this launcher can install is worth saying on the band, which is the one row that is
+    // on screen in every mode. Clicking it asks the same question the automatic check asks -- the
+    // dialog with the notes and the two answers -- rather than sending the user off to another page.
+    if (snapshot.update.phase == LauncherUpdatePhase::Available &&
+        !snapshot.update.remote_version.empty()) {
+        ImGui::SameLine(0.0f, Scale(12.0f));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+            (options.height * g_launcher_dpi_scale - ButtonHeight(38.0f)) * 0.5f);
+        LauncherChipStyle style;
+        // #ffa31a, filled rather than tinted: the badge is the one place in this row that is a colour
+        // rather than a material, and the palette's inverse ink keeps the label readable on it.
+        style.tint = ImVec4(1.0f, 0.639f, 0.102f, 1.0f);
+        style.tint.w = 1.0f;
+        style.tint_strength = 0.86f;
+        style.ink = ThemeColor(ue5mem::PlatformUiTheme().inverse_text);
+        if (LauncherChip(Format(translator, anomaly::MessageId::LauncherUpdateAvailable,
+                {snapshot.update.remote_version}).c_str(),
+                ImVec2(0.0f, ButtonHeight(38.0f)), true, style)) {
+            g_update_prompt_requested = true;
+        }
+    }
     ImGui::EndChild();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
@@ -2301,7 +2877,7 @@ void DrawProxyMode(
     const bool can_install = !snapshot.busy && !snapshot.game_directory.empty() &&
         (snapshot.proxy.state == State::NotInstalled || snapshot.proxy.state == State::UpdateAvailable);
     ImGui::SetCursorPosY((std::max)(ImGui::GetCursorPosY() + Scale(20.0f),
-        ImGui::GetWindowHeight() - Scale(82.0f)));
+        ImGui::GetWindowHeight() - Scale(kLaunchActionRowBottom)));
     ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(),
         ImGui::GetWindowWidth() - Scale(180.0f * 3.0f + 24.0f) - Scale(16.0f)));
     const std::string popup_name = std::string(Text(
@@ -2404,6 +2980,10 @@ std::map<std::filesystem::path, LauncherModIconCache> g_mod_icons;
 // Remote versions learned by the update check, keyed by mod name: a refresh rebuilds the
 // entries, and without this cache the "new version" marker would disappear with them.
 std::map<std::string, std::string> g_mod_remote_versions;
+// The force-load switch belongs to the row of page-wide switches at the top of the mods page, while
+// the list it changes is rebuilt further down. Flipping it therefore asks the next draw of that list
+// to re-classify its rows at once, instead of leaving the conflict marks stale until the timer runs.
+bool g_mods_refresh_requested{};
 
 // Category names are shipped data rather than UI text: a category token is a container identifier
 // the classification and the conflict checks match on, so the table names it without renaming it.
@@ -2468,26 +3048,58 @@ const LauncherModIconCache* LauncherModIcon(const LauncherModEntry& entry) {
 // portrait cover, so nothing is cropped and no slot is mostly empty. The picture itself is
 // fitted whole and centred inside it.
 constexpr float kLauncherModCoverAspect = 3.0f / 4.0f;
-// Draws a mod's cover inside a slot: whole, centred, aspect preserved, and on the shared
-// placeholder until the icon has been decoded. A grid cell is the same slot a list row uses,
-// just wider, so nothing is cropped to fill it: the artwork is shown as the author drew it.
+// What a mod without a cover shows on every palette that is not Naiwa: the font's own picture
+// mark, in the palette's muted ink. It is the glyph the rest of the interface draws its icons
+// with, so the slot reads as "no picture here" in exactly the same hand as everything around it,
+// and it is drawn at roughly one icon's size rather than as artwork of its own.
+void DrawLauncherMissingCoverMark(
+    ImDrawList* draw_list, const ImVec2 slot_min, const ImVec2 slot_size) {
+    ImFont* const font = ImGui::GetFont();
+    if (font == nullptr) return;
+    const float size = (std::min)(ImGui::GetFontSize() * 1.25f,
+        (std::min)(slot_size.x, slot_size.y) * 0.42f);
+    if (size <= 0.0f) return;
+    const char* const glyph = Glyph(0xeb9f);
+    const ImVec2 measured = font->CalcTextSizeA(size, FLT_MAX, 0.0f, glyph);
+    ImVec4 ink = LauncherMutedInk();
+    ink.w = 0.55f;
+    draw_list->AddText(font, size,
+        ImVec2(slot_min.x + (slot_size.x - measured.x) * 0.5f,
+            slot_min.y + (slot_size.y - measured.y) * 0.5f),
+        ImGui::GetColorU32(ink), glyph);
+}
+
+// Draws a mod's cover inside a slot: whole, centred, aspect preserved, and on a placeholder until
+// the icon has been decoded. A grid cell is the same slot a list row uses, just wider, so nothing
+// is cropped to fill it: the artwork is shown as the author drew it.
 void DrawLauncherModCoverImage(
     const LauncherModEntry& entry, const ImVec2 slot_min, const ImVec2 slot_size) {
     if (g_graphics == nullptr || slot_size.x <= 0.0f || slot_size.y <= 0.0f) return;
-    auto* texture = g_graphics->mod_placeholder.Get();
-    auto image_width = static_cast<float>(g_graphics->mod_placeholder_width);
-    auto image_height = static_cast<float>(g_graphics->mod_placeholder_height);
+    ImTextureID texture{};
+    float image_width = 0.0f;
+    float image_height = 0.0f;
     if (const auto* icon = LauncherModIcon(entry); icon != nullptr && icon->texture != nullptr) {
-        texture = icon->texture.Get();
+        texture = reinterpret_cast<ImTextureID>(icon->texture.Get());
         image_width = static_cast<float>(icon->width);
         image_height = static_cast<float>(icon->height);
+    } else if (ue5mem::GetPlatformUiPalette() == ue5mem::PlatformUiPalette::Naiwa &&
+        g_graphics->mod_placeholder_width != 0 && g_graphics->mod_placeholder_height != 0) {
+        // Naiwa is the palette that artwork was drawn for, so it is that palette's placeholder.
+        // Every other palette draws the generic mark below instead of wearing another theme's
+        // character.
+        texture = reinterpret_cast<ImTextureID>(g_graphics->mod_placeholder.Get());
+        image_width = static_cast<float>(g_graphics->mod_placeholder_width);
+        image_height = static_cast<float>(g_graphics->mod_placeholder_height);
     }
-    if (texture == nullptr || image_width <= 0.0f || image_height <= 0.0f) return;
+    if (texture == 0 || image_width <= 0.0f || image_height <= 0.0f) {
+        DrawLauncherMissingCoverMark(ImGui::GetWindowDrawList(), slot_min, slot_size);
+        return;
+    }
     const float scale = (std::min)(slot_size.x / image_width, slot_size.y / image_height);
     const ImVec2 image_size(image_width * scale, image_height * scale);
     const ImVec2 top_left(slot_min.x + (slot_size.x - image_size.x) * 0.5f,
         slot_min.y + (slot_size.y - image_size.y) * 0.5f);
-    ImGui::GetWindowDrawList()->AddImage(reinterpret_cast<ImTextureID>(texture), top_left,
+    ImGui::GetWindowDrawList()->AddImage(texture, top_left,
         ImVec2(top_left.x + image_size.x, top_left.y + image_size.y));
 }
 
@@ -2723,6 +3335,7 @@ struct LauncherModSettingsCache final {
     bool initialized{};
     bool compatibility{true};
     bool bypass{};
+    bool force_load{};
 };
 
 LauncherModSettingsCache& RefreshLauncherModSettings(
@@ -2743,9 +3356,11 @@ LauncherModSettingsCache& RefreshLauncherModSettings(
             ? *loaded_settings : LauncherPakSettings(snapshot);
         cache.compatibility = anomaly::PakModCompatibilityMode(settings);
         cache.bypass = settings.value("enabled", true);
+        cache.force_load = anomaly::PakModForceLoad(settings);
     } catch (...) {
         cache.compatibility = true;
         cache.bypass = false;
+        cache.force_load = false;
     }
     return cache;
 }
@@ -2931,6 +3546,12 @@ void LauncherRefreshMods(
         const auto settings = loaded_settings ? *loaded_settings : LauncherPakSettings(snapshot);
         static anomaly::PakModCatalogCache catalog_cache;
         const auto catalog = catalog_cache.Read(directory, settings);
+        std::erase_if(mods, [&](const auto& entry) {
+            const auto key = anomaly::NormalizePakModKey(LauncherModStateKey(entry));
+            return std::any_of(catalog->begin(), catalog->end(), [&](const auto& row) {
+                return row.key == key && row.restricted;
+            });
+        });
         for (auto& entry : mods) {
             const auto key = anomaly::NormalizePakModKey(LauncherModStateKey(entry));
             for (const auto& row : *catalog) if (anomaly::NormalizePakModKey(row.key) == key) {
@@ -2960,8 +3581,12 @@ void LauncherRefreshMods(
             }
         }
     } catch (...) {
-        // A malformed configuration must not replace a previously saved selection.
+        // Do not expose entries whose resource restrictions could not be determined.
+        mods.clear();
     }
+    std::erase_if(mods, [](const auto& entry) {
+        return anomaly::PakModNameRestricted(entry.key) || anomaly::PakModNameRestricted(entry.display_name);
+    });
     for (auto& entry : mods) {
         // A hand-written group replaces the automatic one: nothing can tell two classes of the
         // same name apart, and a renamed character has to keep all of its mods together.
@@ -3205,12 +3830,27 @@ bool LauncherWriteBypassEnabled(const LauncherSnapshot& snapshot, const bool ena
     });
 }
 
+// The master bypass decides whether mods load at all; this decides what the exclusivity does with a
+// mod that ships the same resources as another one. Off by default: two variants of one body are a
+// mixture nobody asked for, while a patch mod next to the mod it patches is exactly the point.
+bool LauncherWriteForceLoad(const LauncherSnapshot& snapshot, const bool enabled) {
+    return LauncherWritePakSettings(snapshot, [enabled](auto& document) {
+        document["forceLoad"] = enabled;
+    });
+}
+
 bool LauncherSetModEnabled(const LauncherSnapshot& snapshot, const LauncherModEntry& entry,
     const bool enabled) {
     const auto key = LauncherModStateKey(entry);
     try {
         const bool compatibility = LauncherCompatibilityMode(snapshot);
         if (compatibility && LauncherGameRunning()) return false;
+        const auto settings = LauncherPakSettings(snapshot);
+        const auto catalog = anomaly::ReadPakModCatalog(LauncherModsDirectory(snapshot), settings);
+        const auto selected = std::find_if(catalog.begin(), catalog.end(), [&](const auto& row) {
+            return anomaly::NormalizePakModKey(row.key) == anomaly::NormalizePakModKey(key);
+        });
+        if (selected == catalog.end() || (enabled && selected->restricted)) return false;
         const auto write = [&](bool value) {
             return LauncherWritePakSettings(snapshot, [&](auto& document) {
                 const auto catalog = anomaly::ReadPakModCatalog(LauncherModsDirectory(snapshot), document);
@@ -3218,13 +3858,7 @@ bool LauncherSetModEnabled(const LauncherSnapshot& snapshot, const LauncherModEn
             });
         };
         if (compatibility) {
-            const auto settings = LauncherPakSettings(snapshot);
-            const auto catalog = anomaly::ReadPakModCatalog(LauncherModsDirectory(snapshot), settings);
-            const auto selected = std::find_if(catalog.begin(), catalog.end(), [&](const auto& row) {
-                return anomaly::NormalizePakModKey(row.key) == anomaly::NormalizePakModKey(key);
-            });
-            if (selected == catalog.end()) return false;
-            if (enabled) {
+            if (enabled && !anomaly::PakModForceLoad(settings)) {
                 std::vector<LauncherModEntry> all;
                 LauncherRefreshMods(snapshot, all);
                 for (const auto& other : catalog) if (anomaly::PakModsConflict(*selected, other)) {
@@ -3244,6 +3878,8 @@ bool LauncherSetModEnabled(const LauncherSnapshot& snapshot, const LauncherModEn
 
 bool LauncherWriteCompatibilityMode(const LauncherSnapshot& snapshot, const bool compatibility) {
     if (LauncherGameRunning()) return false;
+    try { anomaly::DisableRestrictedPakMods(LauncherModsDirectory(snapshot)); }
+    catch (...) { return false; }
     std::vector<LauncherModEntry> mods;
     LauncherRefreshMods(snapshot, mods);
     if (!LauncherWriteLegacyBypass(snapshot,
@@ -3405,12 +4041,18 @@ bool LauncherFinishModWrite(const LauncherSnapshot& snapshot, const LauncherModE
     const bool enable_after) {
     try {
         const bool compatibility = LauncherCompatibilityMode(snapshot);
-        if (compatibility && enable_after) {
-            const auto catalog = anomaly::ReadPakModCatalog(LauncherModsDirectory(snapshot), LauncherPakSettings(snapshot));
-            const auto selected = std::find_if(catalog.begin(), catalog.end(), [&](const auto& row) {
-                return anomaly::NormalizePakModKey(row.key) == anomaly::NormalizePakModKey(LauncherModStateKey(target));
-            });
-            if (selected != catalog.end()) for (const auto& row : catalog) {
+        const auto settings = LauncherPakSettings(snapshot);
+        const auto catalog = anomaly::ReadPakModCatalog(LauncherModsDirectory(snapshot), settings);
+        const auto selected = std::find_if(catalog.begin(), catalog.end(), [&](const auto& row) {
+            return anomaly::NormalizePakModKey(row.key) == anomaly::NormalizePakModKey(LauncherModStateKey(target));
+        });
+        if (selected == catalog.end()) return false;
+        if (selected->restricted) {
+            static_cast<void>(LauncherSetModFilesEnabled(snapshot, target, false));
+            return false;
+        }
+        if (compatibility && enable_after && !anomaly::PakModForceLoad(settings)) {
+            for (const auto& row : catalog) {
                 if (!anomaly::PakModsConflict(*selected, row)) continue;
                 LauncherModEntry other;
                 other.key = row.key;
@@ -3448,8 +4090,6 @@ LauncherModEntry LauncherDirectoryMod(const std::filesystem::path& path) {
 // Forward declarations: the import path records the GameBanana file id, and those helpers live
 // further down with the update check.
 std::wstring LauncherSystemProxy();
-std::string LauncherHttpGet(const std::wstring& host, const std::wstring& path,
-    bool use_system_proxy = false);
 std::string LauncherGameBananaId(const std::string& link);
 std::string LauncherGameBananaFileId(const std::string& profile_body);
 std::string LauncherGameBananaFileName(const std::string& profile_body);
@@ -3792,9 +4432,14 @@ void LauncherUpdateLog(const std::string& line) {
         << line << "\n";
 }
 
-std::string LauncherHttpGet(const std::wstring& host, const std::wstring& path,
-    const bool use_system_proxy) {
+// One GET to one endpoint. The callers split by how they know their address -- a host and a path, or
+// a whole URL -- and both end up here. The timeout is theirs because an address known not to answer
+// is not worth the wait a download is worth.
+std::string LauncherHttpGetRequest(const std::wstring& host, const std::wstring& path,
+    const INTERNET_PORT port, const bool secure, const bool use_system_proxy, int* status_code,
+    const DWORD timeout_ms) {
     std::string result;
+    if (status_code != nullptr) *status_code = 0;
     // Direct first: a stale or half-configured system proxy is a common cause of "works in curl,
     // fails in WinHTTP". The caller retries with the system proxy when this returns nothing.
     const std::wstring proxy = use_system_proxy ? std::wstring{} : LauncherSystemProxy();
@@ -3809,11 +4454,13 @@ std::string LauncherHttpGet(const std::wstring& host, const std::wstring& path,
     // which shows up as an intermittent handshake failure.
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
     WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-    WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
-    HINTERNET connection = WinHttpConnect(session, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    WinHttpSetTimeouts(session, static_cast<int>(timeout_ms), static_cast<int>(timeout_ms),
+        static_cast<int>(timeout_ms), static_cast<int>(timeout_ms));
+    HINTERNET connection = WinHttpConnect(session, host.c_str(), port, 0);
     if (connection != nullptr) {
         HINTERNET request = WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr,
-            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            secure ? WINHTTP_FLAG_SECURE : 0);
         if (request != nullptr) {
             // GameBanana answers with redirects for some hosts and rejects unknown clients, so the
             // policy follows redirects and the request presents a browser-style identity.
@@ -3830,6 +4477,16 @@ std::string LauncherHttpGet(const std::wstring& host, const std::wstring& path,
             const BOOL received = sent != FALSE ? WinHttpReceiveResponse(request, nullptr) : FALSE;
             const DWORD receive_error = received == FALSE ? GetLastError() : 0;
             if (sent != FALSE && received != FALSE) {
+                // The status is what separates "this repository publishes no release" from "the API
+                // refused to answer at all", and the launcher reports the difference to the user.
+                DWORD status{};
+                DWORD status_size = sizeof(status);
+                if (WinHttpQueryHeaders(request,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
+                        WINHTTP_NO_HEADER_INDEX) != FALSE && status_code != nullptr) {
+                    *status_code = static_cast<int>(status);
+                }
                 // Read until the stream reports zero bytes: QueryDataAvailable returns 0 for
                 // "nothing right now" too, which used to truncate the body mid-JSON.
                 std::string chunk(16 * 1024, '\0');
@@ -3860,6 +4517,38 @@ std::string LauncherHttpGet(const std::wstring& host, const std::wstring& path,
     }
     WinHttpCloseHandle(session);
     return result;
+}
+
+std::string LauncherHttpGet(const std::wstring& host, const std::wstring& path,
+    const bool use_system_proxy, int* status_code) {
+    return LauncherHttpGetRequest(host, path, INTERNET_DEFAULT_HTTPS_PORT, true,
+        use_system_proxy, status_code, 8000);
+}
+
+// A GET for a caller holding a whole URL: the update check addresses api.github.com and the mirrors
+// that forward it, and every one of those is spelled as a URL rather than as a host and a path.
+std::string LauncherHttpGetUrl(const std::string& url, const bool use_system_proxy,
+    int* status_code, const DWORD timeout_ms) {
+    if (status_code != nullptr) *status_code = 0;
+    const std::wstring wide(url.begin(), url.end());
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (WinHttpCrackUrl(wide.c_str(), static_cast<DWORD>(wide.size()), 0, &parts) == FALSE) {
+        LauncherUpdateLog("url get: crack failed " + std::to_string(GetLastError()) +
+            " url=" + url);
+        return {};
+    }
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength != 0) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    if (path.empty()) path = L"/";
+    const INTERNET_PORT port = parts.nPort == 0 ? INTERNET_DEFAULT_HTTPS_PORT : parts.nPort;
+    return LauncherHttpGetRequest(host, path, port, parts.nScheme == INTERNET_SCHEME_HTTPS,
+        use_system_proxy, status_code, timeout_ms);
 }
 
 // "https://gamebanana.com/mods/735632" -> 735632
@@ -3960,15 +4649,6 @@ std::string LauncherCheckUpdates(std::vector<LauncherModEntry>& mods,
 }
 
 
-// Live byte counter and cancel flag for the browse installer's progress bar.
-std::atomic<long long> g_download_bytes{0};
-std::atomic<long long> g_download_total{0};
-std::atomic<bool> g_download_cancel{false};
-
-
-bool LauncherDownloadUrl(const std::string& url, const std::filesystem::path& destination,
-    bool track_install);
-
 // Downloads the newest file of a GameBanana mod and swaps it in, keeping icon.png / mod.json.
 std::string LauncherUpdateMod(
     const LauncherSnapshot& snapshot, const LauncherModEntry& entry) {
@@ -3985,7 +4665,7 @@ std::string LauncherUpdateMod(
 
         std::error_code error;
         const auto archive = std::filesystem::temp_directory_path(error) / L"anomaly-mod-update.zip";
-        if (!LauncherDownloadUrl(download, archive, false)) {
+        if (!LauncherDownloadUrl(download, archive)) {
             return Tr(anomaly::MessageId::LauncherMsgDownloadFailed);
         }
 
@@ -4220,7 +4900,7 @@ std::wstring LauncherSystemProxy() {
 // Splits a URL with WinHTTP itself instead of hand-rolled string slicing: the manual version
 // produced a host of "https:\" and the request failed with 12005.
 bool LauncherDownloadUrl(const std::string& url, const std::filesystem::path& destination,
-    const bool track_install = false) {
+    LauncherDownloadProgress* const progress) {
     const std::wstring wide(url.begin(), url.end());
     URL_COMPONENTS parts{};
     parts.dwStructSize = sizeof(parts);
@@ -4270,16 +4950,16 @@ bool LauncherDownloadUrl(const std::string& url, const std::filesystem::path& de
             if (WinHttpSendRequest(request, headers, static_cast<DWORD>(-1L), WINHTTP_NO_REQUEST_DATA,
                     0, 0, 0) != FALSE &&
                 WinHttpReceiveResponse(request, nullptr) != FALSE) {
-                if (track_install) {
-                    g_download_bytes.store(0);
+                if (progress != nullptr) {
+                    progress->bytes.store(0);
                     wchar_t length_text[32]{};
                     DWORD length_size = sizeof(length_text);
                     if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH,
                             WINHTTP_HEADER_NAME_BY_INDEX, length_text, &length_size,
                             WINHTTP_NO_HEADER_INDEX) != FALSE) {
-                        g_download_total.store(_wtoi64(length_text));
+                        progress->total.store(_wtoi64(length_text));
                     } else {
-                        g_download_total.store(0);
+                        progress->total.store(0);
                     }
                 }
                 std::filesystem::create_directories(destination.parent_path());
@@ -4301,9 +4981,9 @@ bool LauncherDownloadUrl(const std::string& url, const std::filesystem::path& de
                         out.write(chunk.data(), static_cast<std::streamsize>(read));
                         if (!out) { ok = false; break; }
                         received += static_cast<long long>(read);
-                        if (track_install) g_download_bytes.fetch_add(static_cast<long long>(read));
+                        if (progress != nullptr) progress->bytes.fetch_add(static_cast<long long>(read));
                         read = 0;
-                        if (track_install && g_download_cancel.load()) {
+                        if (progress != nullptr && progress->cancel.load()) {
                             LauncherUpdateLog("url dl: cancelled by user");
                             ok = false;
                             break;
@@ -4396,7 +5076,7 @@ ID3D11ShaderResourceView* LauncherThumbTexture(const std::string& url) {
 }
 
 bool LauncherLoadGbPage(const int page, const std::string& query, const std::string& sort,
-    const std::string& category_id, std::vector<LauncherGbItem>& items) {
+    const std::string& category_id, std::vector<LauncherGbItem>& items, bool& exhausted) {
     // Empty query browses the game feed; a query goes through the search endpoint. The game filter
     // is `_idGameRow`; `_idGame` is silently ignored.
     std::string path_text;
@@ -4438,6 +5118,8 @@ bool LauncherLoadGbPage(const int page, const std::string& query, const std::str
     }
     const auto records = parsed.find("_aRecords");
     if (records == parsed.end() || !records->is_array()) return false;
+    // Filtering every row on a page must not hide later pages of eligible mods.
+    exhausted = records->empty();
     for (const auto& record : *records) {
         if (!record.is_object()) continue;
         const int id = record.value("_idRow", 0);
@@ -4445,6 +5127,7 @@ bool LauncherLoadGbPage(const int page, const std::string& query, const std::str
         LauncherGbItem item;
         item.id = std::to_string(id);
         item.name = record.value("_sName", std::string{});
+        if (anomaly::PakModNameRestricted(item.name)) continue;
         item.page_url = record.value("_sProfileUrl", std::string{});
         if (const auto root = record.find("_aRootCategory");
             root != record.end() && root->is_object()) {
@@ -4543,7 +5226,7 @@ std::wstring LauncherWiden(const std::string& utf8) {
 // WinHTTP stalls on some GameBanana responses; curl is present on Windows 10+ and handles the
 // redirect chain reliably, so it is the fallback when the built-in path fails.
 bool LauncherDownloadWithCurl(const std::string& url, const std::filesystem::path& destination) {
-    if (g_download_cancel.load()) return false;
+    if (g_mod_download.cancel.load()) return false;
     const std::wstring wide(url.begin(), url.end());
     std::error_code error;
     std::filesystem::remove(destination, error);
@@ -4608,6 +5291,8 @@ bool LauncherFetchFileFallback(const std::string& mod_id, LauncherGbFile& file,
 std::string LauncherInstallFromGameBanana(
     const LauncherSnapshot& snapshot, const std::string& mod_id, const std::string& display_name) {
     try {
+        if (anomaly::PakModNameRestricted(display_name))
+            return Tr(anomaly::MessageId::LauncherModsFileChangeFailed);
         const std::wstring profile_path = std::wstring(L"/apiv11/Mod/") +
             std::wstring(mod_id.begin(), mod_id.end()) + L"/ProfilePage";
         std::string body = LauncherHttpGet(L"gamebanana.com", profile_path);
@@ -4635,8 +5320,8 @@ std::string LauncherInstallFromGameBanana(
         std::error_code error;
         const auto archive = std::filesystem::temp_directory_path(error) / L"anomaly-browse-install.bin";
         std::filesystem::remove(archive, error);
-        if (!LauncherDownloadUrl(file.url, archive, true)) {
-            if (g_download_cancel.load()) {
+        if (!LauncherDownloadUrl(file.url, archive, &g_mod_download)) {
+            if (g_mod_download.cancel.load()) {
                 std::filesystem::remove(archive, error);
                 return Tr(anomaly::MessageId::LauncherMsgCancelled);
             }
@@ -4646,7 +5331,7 @@ std::string LauncherInstallFromGameBanana(
                 return Tr(anomaly::MessageId::LauncherMsgDownloadFailedBoth);
             }
         }
-        auto extracted = anomaly::launcher::ExtractModArchive(archive, &g_download_cancel);
+        auto extracted = anomaly::launcher::ExtractModArchive(archive, &g_mod_download.cancel);
         std::filesystem::remove(archive, error);
         if (!extracted.Ok()) return LauncherArchiveFailure(extracted);
         const auto& staging = extracted.directory;
@@ -4659,7 +5344,7 @@ std::string LauncherInstallFromGameBanana(
         bool enable_after{};
         // Copy the whole tree, not just the pak triplet: some mods ship companion assets (image sets,
         // scripts) that a tool reads at runtime, and dropping them silently breaks the mod.
-        if (g_download_cancel.load()) return Tr(anomaly::MessageId::LauncherMsgCancelled);
+        if (g_mod_download.cancel.load()) return Tr(anomaly::MessageId::LauncherMsgCancelled);
         if (!LauncherPrepareModWrite(snapshot, target_mod, enable_after))
             return Tr(anomaly::MessageId::LauncherModsFileChangeFailed);
         std::filesystem::create_directories(target, error);
@@ -4748,7 +5433,7 @@ void DrawBrowseMode(
     g_decode_budget = 1;  // one image per frame
     struct PageResult final {
         int page{};
-        bool ok{};
+        bool ok{}, exhausted{};
         std::vector<LauncherGbItem> items;
     };
     static char search[96]{};
@@ -4788,7 +5473,7 @@ void DrawBrowseMode(
             PageResult result;
             result.page = page;
             try {
-                result.ok = LauncherLoadGbPage(page, query, sort, category, result.items);
+                result.ok = LauncherLoadGbPage(page, query, sort, category, result.items, result.exhausted);
             } catch (...) {
                 LauncherUpdateLog("browse: page load failed");
             }
@@ -4819,7 +5504,7 @@ void DrawBrowseMode(
                     if (!item.category_id.empty() && !item.category.empty())
                         g_gb_categories[item.category_id] = item.category;
                 }
-                exhausted = result.items.empty();
+                exhausted = result.exhausted;
                 loaded_pages = result.page;
                 if (result.page == 1) {
                     items = std::move(result.items);
@@ -5140,8 +5825,8 @@ void DrawBrowseMode(
         ImGui::SameLine();
         const bool installed = installed_ids.count(item.id) != 0;
         if (install_running && install_target == item.id) {
-            const double done = static_cast<double>(g_download_bytes.load());
-            const double total = static_cast<double>(g_download_total.load());
+            const double done = static_cast<double>(g_mod_download.bytes.load());
+            const double total = static_cast<double>(g_mod_download.total.load());
             const double seconds = ImGui::GetTime() - install_started;
             if (total > 0.0) {
                 const std::string overlay = Tr(anomaly::MessageId::LauncherBrowseProgressPercent,
@@ -5158,7 +5843,7 @@ void DrawBrowseMode(
             ImGui::SameLine();
             if (LauncherChip((Tr(anomaly::MessageId::LauncherModsCancel) + "##cancel" +
                     item.id).c_str())) {
-                g_download_cancel.store(true);
+                g_mod_download.cancel.store(true);
             }
         } else if (LauncherChip((std::string(installed ? Text(translator, anomaly::MessageId::LauncherModsReinstall)
                 : Text(translator, anomaly::MessageId::LauncherModsInstall)) +
@@ -5167,9 +5852,9 @@ void DrawBrowseMode(
             install_running = true;
             install_target = item.id;
             install_started = ImGui::GetTime();
-            g_download_cancel.store(false);
-            g_download_bytes.store(0);
-            g_download_total.store(0);
+            g_mod_download.cancel.store(false);
+            g_mod_download.bytes.store(0);
+            g_mod_download.total.store(0);
             const LauncherSnapshot snapshot_copy = snapshot;
             const LauncherGbItem target_item = item;
             std::thread([snapshot_copy, target_item] {
@@ -5387,13 +6072,16 @@ void DrawModsMode(
         } catch (...) {
             mod_settings.compatibility = true;
             mod_settings.bypass = false;
+            mod_settings.force_load = false;
         }
         LauncherRefreshMods(snapshot, mods, &settings);
         for (auto& entry : mods) entry.selected = selected_names.count(LauncherModStateKey(entry)) != 0;
         refreshed = true;
         last_refresh = ImGui::GetTime();
     };
-    if (!refreshed || cached_game != snapshot.game_directory || cached_client != snapshot.selected_client ||
+    const bool refresh_requested = std::exchange(g_mods_refresh_requested, false);
+    if (refresh_requested || !refreshed ||
+        cached_game != snapshot.game_directory || cached_client != snapshot.selected_client ||
         (ImGui::GetTime() - last_refresh > 2.0 && !check_running)) refresh_mods();
 
     if (directory.empty()) {
@@ -5425,6 +6113,9 @@ void DrawModsMode(
         import_message = LauncherOrganizeMessage(LauncherOrganizeModFolders(snapshot, mods));
         refresh_mods();
     }
+    // The exclusivity of the mods page -- "load both anyway" -- is a switch of the page, not a
+    // command on this list, so it is drawn on the first row next to compatibility mode; the row of
+    // commands below stays with the list it acts on.
     ImGui::SameLine();
     if (check_running) {
         ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherModsChecking));
@@ -5711,15 +6402,25 @@ void DrawModsMode(
         return tags;
     };
 
-    // Measure inside the scrolling child so its scrollbar is excluded from the card widths.
-    ImGui::BeginChild("ModsList", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None,
-        ImGuiWindowFlags_None);
+    const auto draw_notes = [](const std::string& notes, const float width) {
+        // Notes are edited as multiline text; keep the preview on one line and
+        // show the original text on hover so long notes cannot widen a card.
+        std::string preview = notes;
+        for (char& character : preview) {
+            if (character == '\r' || character == '\n' || character == '\t') character = ' ';
+        }
+        const float gray = LauncherSurfaceIsLight() ? 0.4f : 0.65f;
+        ImGui::TextColored(ImVec4(gray, gray, gray, 1.0f), "%s",
+            Ellipsize(preview, width).c_str());
+        Tooltip(notes.c_str());
+    };
+
+    const float grid_width = anomaly::launcher::BeginModsList();
     if (scroll_to_top) {
         ImGui::SetScrollY(0.0f);
         scroll_to_top = false;
     }
     const float grid_spacing = Scale(12.0f);
-    const float grid_width = ImGui::GetContentRegionAvail().x;
     const int grid_columns = std::clamp(static_cast<int>(
         (grid_width + grid_spacing) / (Scale(176.0f) + grid_spacing)), 2, 6);
     const float card_width = std::floor(
@@ -5756,6 +6457,11 @@ void DrawModsMode(
         }
         const std::string title = entry.display_name.empty() ? entry.name : entry.display_name;
         ImGui::TextUnformatted(Ellipsize(title, card_inner).c_str());
+        if (entry.notes.empty()) {
+            ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
+        } else {
+            draw_notes(entry.notes, card_inner);
+        }
         std::string meta = skin_tags(entry, category);
         if (!entry.version.empty()) {
             if (!meta.empty()) meta += "  ·  ";
@@ -6060,7 +6766,16 @@ void DrawModsMode(
                     meta += Tr(anomaly::MessageId::LauncherModsNewVersionInline,
                         {entry.remote_version});
                 }
-                ImGui::TextWrapped("%s", title.c_str());
+                if (entry.notes.empty()) {
+                    ImGui::TextWrapped("%s", title.c_str());
+                } else {
+                    const float title_row_width = ImGui::GetContentRegionAvail().x;
+                    const float title_width = title_row_width * 0.6f;
+                    ImGui::TextUnformatted(Ellipsize(title, title_width).c_str());
+                    Tooltip(title.c_str());
+                    ImGui::SameLine();
+                    draw_notes(entry.notes, ImGui::GetContentRegionAvail().x);
+                }
                 ImGui::TextDisabled("%zu  ·  %.1f MB%s", entry.files,
                     static_cast<double>(entry.bytes) / (1024.0 * 1024.0), meta.c_str());
                 // Every action is a button inside a disabled scope: the click is evaluated first and the
@@ -6367,7 +7082,7 @@ void DrawAttachMode(
     const float inject_width = (std::max)(200.0f, CommandButtonWidth(0xe8e5, inject_label));
     const float launch_width = (std::max)(240.0f, CommandButtonWidth(0xe768, launch_label));
     ImGui::SetCursorPosY((std::max)(ImGui::GetCursorPosY() + Scale(20.0f),
-        ImGui::GetWindowHeight() - Scale(82.0f)));
+        ImGui::GetWindowHeight() - Scale(kLaunchActionRowBottom)));
     ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(),
         ImGui::GetWindowWidth() - Scale(inject_width + 12.0f + launch_width) - Scale(16.0f)));
     if (CommandButton(
@@ -6383,9 +7098,61 @@ void DrawAttachMode(
     }
 }
 
+// A support button is the platform's own artwork, drawn at the width it is published for and at the
+// height that width implies, inside the capsule every command in this window is drawn in. The picture
+// is embedded in the image rather than fetched, so the button also appears on a machine that never
+// reaches the network -- and a launcher whose texture failed to upload falls back to a box of the same
+// size carrying its label.
+ImVec2 SupportButtonSize(const ComPtr<ID3D11ShaderResourceView>& texture,
+    const std::uint32_t width, const std::uint32_t height) {
+    (void)texture;
+    const float button_width = Scale(kSupportButtonWidth);
+    const float aspect = width != 0 && height != 0
+        ? static_cast<float>(height) / static_cast<float>(width)
+        : 0.25f;
+    return ImVec2(button_width, button_width * aspect);
+}
+
+// The two controls in this window that leave the machine: they hand the address to the shell, which
+// opens it in the user's browser, rather than reimplementing a payment flow in a game launcher.
+bool SupportButton(const ComPtr<ID3D11ShaderResourceView>& texture, const std::uint32_t width,
+    const std::uint32_t height, const char* id, const char* tooltip, const std::wstring_view url) {
+    const ImVec2 size = SupportButtonSize(texture, width, height);
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    const ImVec2 max(min.x + size.x, min.y + size.y);
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    ImDrawList* const draw = ImGui::GetWindowDrawList();
+    const float rounding = size.y * 0.5f;
+    if (texture != nullptr) {
+        // Full brightness under the pointer, a shade less without it: the artwork carries its own
+        // colour, so the only feedback these buttons can give is how brightly they are painted.
+        draw->AddImageRounded(
+            static_cast<ImTextureID>(reinterpret_cast<std::uintptr_t>(texture.Get())),
+            min, max, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, hovered ? 1.0f : 0.92f)),
+            rounding, ImDrawFlags_RoundCornersAll);
+    } else {
+        // The palette's own accent, and the label centred in it.
+        draw->AddRectFilled(min, max,
+            ImGui::GetColorU32(ThemeColor(ue5mem::PlatformUiTheme().accent)), rounding);
+        const ImVec2 caption = ImGui::CalcTextSize(tooltip);
+        draw->AddText(ImVec2(min.x + (size.x - caption.x) * 0.5f,
+                          min.y + (size.y - caption.y) * 0.5f),
+            ImGui::GetColorU32(ThemeColor(ue5mem::PlatformUiTheme().inverse_text)), tooltip);
+    }
+    Tooltip(tooltip);
+    if (pressed) {
+        const std::wstring address(url);
+        ShellExecuteW(nullptr, L"open", address.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    return pressed;
+}
+
 void DrawLaunchMode(
-    HWND window, LauncherController& controller, const LauncherSnapshot& snapshot,
-    const anomaly::Translator& translator) {
+    HWND window, LauncherController& controller,
+    const LauncherSnapshot& snapshot, const anomaly::Translator& translator) {
     static int launch_mode = 0;
 
     ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSectionNteLauncher));
@@ -6474,8 +7241,28 @@ void DrawModMode(
             settings_error = Text(translator, anomaly::MessageId::LauncherModsModeSaveFailed);
         }
     }
+    const float compatibility_switch_right = ImGui::GetItemRectMax().x;
     ImGui::EndDisabled();
     Tooltip(Text(translator, anomaly::MessageId::LauncherModsCompatibilityHint));
+    // The exclusivity switch lives on this row rather than next to the list: it answers the same
+    // question as the two switches left of it -- how the mods are loaded -- and this row stays put
+    // while the list below scrolls. It only changes what the next classification of that list does,
+    // so it asks for one instead of rebuilding the rows from here.
+    ImGui::SetCursorScreenPos(
+        ImVec2(compatibility_switch_right + ImGui::GetStyle().ItemSpacing.x, switch_row_y));
+    bool force_load = settings.force_load;
+    ImGui::BeginDisabled(snapshot.game_directory.empty());
+    if (anomaly::glass::Switch(
+            Text(translator, anomaly::MessageId::LauncherModsForceLoad), &force_load)) {
+        if (LauncherWriteForceLoad(snapshot, force_load)) {
+            settings.force_load = force_load;
+            g_mods_refresh_requested = true;
+            settings_error.clear();
+        } else {
+            settings_error = Text(translator, anomaly::MessageId::SettingsSaveFailed);
+        }
+    }
+    ImGui::EndDisabled();
     if (!settings_error.empty()) ImGui::TextDisabled("%s", settings_error.c_str());
     if (ImGui::BeginChild(mod_mode == 0 ? "ModManagementContent" : "ModDownloadContent", ImVec2(0.0f, 0.0f))) {
         if (mod_mode == 0) DrawModsMode(window, controller, snapshot, translator);
@@ -6531,6 +7318,566 @@ std::optional<std::string> ChooseLauncherThemeImage(
         if (error) return std::nullopt;
     }
     return LauncherNarrow(std::filesystem::path(L"assets") / L"theme" / source.filename());
+}
+
+// The release page in the user's browser: the one place that explains a version in full, and where
+// the dialog sends anyone the lookup itself could not help.
+void LauncherOpenReleasePage(const LauncherUpdateStatus& update) {
+    const std::wstring url = Utf8Wide(update.page_url.empty()
+        ? std::string(anomaly::launcher::kReleasePageUrl) : update.page_url);
+    ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// The failure a check or an install reported, worded by the launcher where it can be. A rate-limited
+// API, an unreachable host and an answer that is not a release are different problems with
+// different answers, and the installer's own diagnostics are passed through as they were produced.
+std::string UpdateFailureText(
+    const anomaly::Translator& translator, const LauncherUpdateStatus& update) {
+    const std::string status = std::to_string(update.http_status);
+    switch (update.failure) {
+    case LauncherUpdateFailure::Network:
+        return Text(translator, anomaly::MessageId::LauncherUpdateNetworkFailed);
+    case LauncherUpdateFailure::RateLimited:
+        return Format(translator, anomaly::MessageId::LauncherUpdateRateLimited, {status});
+    case LauncherUpdateFailure::Http:
+        return Format(translator, anomaly::MessageId::LauncherUpdateHttpFailed, {status});
+    case LauncherUpdateFailure::NotRelease:
+        return Format(translator, anomaly::MessageId::LauncherUpdateNotRelease, {status});
+    case LauncherUpdateFailure::Check:
+        return Format(translator, anomaly::MessageId::LauncherUpdateCheckFailed, {update.detail});
+    case LauncherUpdateFailure::Install:
+        return Format(translator, anomaly::MessageId::LauncherUpdateFailed, {update.detail});
+    case LauncherUpdateFailure::None:
+        break;
+    }
+    return Format(translator, anomaly::MessageId::LauncherUpdateCheckFailed, {update.detail});
+}
+
+// The update's own byte counters and cancellation control, independent of a mod download.
+// A transfer without a reported length shows received bytes instead of a percentage.
+void LauncherDrawDownloadProgress(const anomaly::Translator& translator) {
+    const double done = static_cast<double>(g_update_download.bytes.load());
+    const double total = static_cast<double>(g_update_download.total.load());
+    // Seconds since this download started: the bar only appears while one runs, so a static clock
+    // reset when the transfer begins is all the elapsed time it needs.
+    static double started{};
+    static long long last_seen{};
+    static bool running{};
+    if (!running || done < last_seen) {
+        started = ImGui::GetTime();
+        running = true;
+    }
+    last_seen = static_cast<long long>(done);
+    const double seconds = ImGui::GetTime() - started;
+    const double megabytes = done / (1024.0 * 1024.0);
+    if (total > 0.0) {
+        const std::string overlay = Format(translator,
+            anomaly::MessageId::LauncherBrowseProgressPercent,
+            {Num(megabytes, 1), Num(total / (1024.0 * 1024.0), 1),
+                Num(done * 100.0 / total, 0), Num(seconds, 0)});
+        ImGui::ProgressBar(static_cast<float>(done / total), ImVec2(Scale(260.0f), 0.0f),
+            overlay.c_str());
+    } else {
+        ImGui::TextDisabled("%s", Format(translator,
+            anomaly::MessageId::LauncherBrowseProgressBytes,
+            {Num(megabytes, 1), Num(seconds, 0)}).c_str());
+    }
+    ImGui::SameLine();
+    // The one command that makes sense beside a running transfer.
+    if (LauncherChip((Tr(anomaly::MessageId::LauncherModsCancel) +
+            "##cancel-update-download").c_str())) {
+        g_update_download.cancel.store(true);
+    }
+}
+
+// The state of the running update, as both the page and the dialog report it.
+std::string UpdatePhaseText(
+    const anomaly::Translator& translator, const LauncherUpdateStatus& update) {
+    switch (update.phase) {
+    case LauncherUpdatePhase::Idle:
+        return {};
+    case LauncherUpdatePhase::Checking:
+        return Text(translator, anomaly::MessageId::LauncherUpdateChecking);
+    case LauncherUpdatePhase::UpToDate:
+        return Format(translator, anomaly::MessageId::LauncherUpdateUpToDate,
+            {update.remote_version});
+    case LauncherUpdatePhase::Available:
+        return Format(translator, anomaly::MessageId::LauncherUpdateAvailable,
+            {update.remote_version});
+    case LauncherUpdatePhase::Downloading:
+        return Text(translator, anomaly::MessageId::LauncherUpdateDownloading);
+    case LauncherUpdatePhase::Installing:
+        return Text(translator, anomaly::MessageId::LauncherUpdateInstalling);
+    case LauncherUpdatePhase::Installed:
+        return Text(translator, anomaly::MessageId::LauncherUpdateInstalled);
+    case LauncherUpdatePhase::Failed:
+        return UpdateFailureText(translator, update);
+    }
+    return {};
+}
+
+ImVec4 UpdatePhaseInk(const LauncherUpdatePhase phase) {
+    const auto& theme = ue5mem::PlatformUiTheme();
+    switch (phase) {
+    case LauncherUpdatePhase::Available: return ThemeColor(theme.warning);
+    case LauncherUpdatePhase::Installed: return ThemeColor(theme.success);
+    case LauncherUpdatePhase::Failed: return ThemeColor(theme.danger);
+    default: return LauncherMutedInk();
+    }
+}
+
+// The launcher's own updates: the version this build is, the newest release it found, and the two
+// commands that follow from them. The update replaces the files of this folder and restarts the
+// window, so the button that starts it names the version it installs.
+void DrawUpdateSettings(
+    LauncherController& controller, const LauncherSnapshot& snapshot,
+    const anomaly::Translator& translator) {
+    const LauncherUpdateStatus& update = snapshot.update;
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSectionUpdates));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(Text(translator, anomaly::MessageId::LauncherSettingAutoUpdate));
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - Scale(70.0f) - Scale(10.0f));
+    bool auto_check = update.auto_check;
+    if (anomaly::glass::Switch("##launcher-auto-update", &auto_check)) {
+        controller.SetAutoCheckUpdates(auto_check);
+    }
+    ImGui::TextDisabled("%s", Format(translator, anomaly::MessageId::LauncherUpdateCurrent,
+        {ANOMALY_SDK_VERSION_STRING}).c_str());
+    const bool busy = snapshot.busy || update.Busy();
+    if (LauncherChip(Text(translator, update.phase == LauncherUpdatePhase::Checking
+            ? anomaly::MessageId::LauncherUpdateChecking
+            : anomaly::MessageId::LauncherUpdateCheck), {}, !busy)) {
+        controller.CheckForUpdates();
+    }
+    // The update command exists only while there is a release to install, so the row never offers
+    // something the launcher has no version for.
+    if (update.CanInstall()) {
+        ImGui::SameLine();
+        if (LauncherChip(Format(translator, anomaly::MessageId::LauncherUpdateInstall,
+                {update.remote_version}).c_str(), {}, !busy)) {
+            controller.InstallUpdate();
+        }
+    }
+    ImGui::SameLine();
+    // The release page is the only place that says what a new version changes, and it is where a
+    // user goes when they would rather read about it before installing.
+    if (LauncherChip(Text(translator, anomaly::MessageId::LauncherUpdateOpenPage))) {
+        LauncherOpenReleasePage(update);
+    }
+    const std::string status = UpdatePhaseText(translator, update);
+    if (update.phase == LauncherUpdatePhase::Downloading) {
+        LauncherDrawDownloadProgress(translator);
+    } else if (!status.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(UpdatePhaseInk(update.phase), "%s", status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+}
+
+// The release notes are markdown, and the shell already owns the parser for the markdown it draws
+// (the first-run notice is authored in it). The launcher reuses that parser and draws the blocks
+// itself, in its own ink: the same document, rendered the way the rest of this window is.
+//
+// Emphasis is faux bold -- the run drawn twice -- because the launcher bakes one font weight, and a
+// run that wrapped is not doubled: the second draw would land on the line above it.
+void LauncherDrawEmphasis(const std::string& text) {
+    ImGui::TextUnformatted(text.c_str());
+    if (ImGui::GetItemRectSize().y > ImGui::GetTextLineHeight() * 1.6f) return;
+    const ImVec2 origin = ImGui::GetItemRectMin();
+    ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+        ImVec2(origin.x + (std::max)(0.5f, Scale(0.5f)), origin.y),
+        ImGui::GetColorU32(ImGuiCol_Text), text.c_str());
+}
+
+// One line of a block: the runs stay in a single sentence, so emphasis and links keep their place.
+void LauncherDrawNoticeRuns(const std::vector<anomaly::NoticeRun>& runs) {
+    const auto& theme = ue5mem::PlatformUiTheme();
+    ImGui::PushTextWrapPos();
+    for (std::size_t index = 0; index < runs.size(); ++index) {
+        if (index > 0) ImGui::SameLine(0.0f, 0.0f);
+        const anomaly::NoticeRun& run = runs[index];
+        switch (run.style) {
+        case anomaly::NoticeRunStyle::Text:
+            ImGui::TextUnformatted(run.text.c_str());
+            break;
+        case anomaly::NoticeRunStyle::Emphasis:
+            LauncherDrawEmphasis(run.text);
+            break;
+        case anomaly::NoticeRunStyle::Code:
+            ImGui::TextColored(LauncherMutedInk(), "%s", run.text.c_str());
+            break;
+        case anomaly::NoticeRunStyle::Link:
+            ImGui::TextColored(ThemeColor(theme.accent), "%s", run.text.c_str());
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s", run.url.c_str());
+            }
+            // A link in a release note is the one thing here that leaves the machine: it goes to the
+            // shell like every other address this window opens.
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !run.url.empty()) {
+                const std::wstring url = Utf8Wide(run.url);
+                ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            break;
+        }
+    }
+    ImGui::PopTextWrapPos();
+}
+
+// A heading: the same text a little larger and painted twice a hair apart, which is the whole of the
+// emphasis this window has -- it bakes one font weight, so "bold" is the glyphs drawn again and
+// "larger" is the atlas drawn at a bigger size. A heading that would not fit the pane keeps the body
+// size and wraps like any other line, because a clipped heading is worse than a plain one.
+void LauncherDrawHeading(const std::vector<anomaly::NoticeRun>& runs, const bool muted) {
+    std::string text;
+    for (const anomaly::NoticeRun& run : runs) text += run.text;
+    if (text.empty()) return;
+    ImFont* const font = ImGui::GetFont();
+    const float size = ImGui::GetFontSize() * 1.18f;
+    const ImVec2 measured = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+    const ImVec4 ink = muted ? LauncherMutedInk() : LauncherInk();
+    if (measured.x > ImGui::GetContentRegionAvail().x) {
+        ImGui::TextWrapped("%s", text.c_str());
+        return;
+    }
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* const draw = ImGui::GetWindowDrawList();
+    const ImU32 color = ImGui::GetColorU32(ink);
+    const float bold = (std::max)(0.6f, Scale(0.6f));
+    draw->AddText(font, size, origin, color, text.c_str());
+    draw->AddText(font, size, ImVec2(origin.x + bold, origin.y), color, text.c_str());
+    ImGui::Dummy(measured);
+}
+
+void LauncherDrawReleaseNotes(const anomaly::NoticeDocument& document) {
+    for (std::size_t index = 0; index < document.blocks.size(); ++index) {
+        const anomaly::NoticeBlock& block = document.blocks[index];
+        switch (block.kind) {
+        case anomaly::NoticeBlockKind::Heading:
+        case anomaly::NoticeBlockKind::Subheading: {
+            // The release opens with its own name and date, which is context rather than a section;
+            // every heading is the same emphasis, only the first is quieter.
+            LauncherDrawHeading(block.runs, index == 0);
+            ImGui::Spacing();
+            break;
+        }
+        case anomaly::NoticeBlockKind::Paragraph:
+            LauncherDrawNoticeRuns(block.runs);
+            ImGui::Spacing();
+            break;
+        case anomaly::NoticeBlockKind::Bullet:
+            ImGui::Bullet();
+            ImGui::SameLine();
+            LauncherDrawNoticeRuns(block.runs);
+            ImGui::Spacing();
+            break;
+        case anomaly::NoticeBlockKind::Numbered:
+            ImGui::TextUnformatted(block.marker.c_str());
+            ImGui::SameLine();
+            LauncherDrawNoticeRuns(block.runs);
+            ImGui::Spacing();
+            break;
+        case anomaly::NoticeBlockKind::Separator:
+            ImGui::Separator();
+            break;
+        }
+    }
+}
+
+// The parsed notes, kept across frames: the document only changes when the release does, and parsing
+// a few kilobytes of markdown every frame for a dialog that is usually closed is wasted work.
+// git-cliff marks a change's scope with single asterisks -- "*(autotaxi)* Add ..." -- which is not
+// emphasis in the shell's markdown subset, so the markers would reach the screen. Keeping "**" (real
+// bold) and the asterisk a bullet starts with, and dropping every other one, leaves the scope text
+// readable and the bold intact.
+std::string LauncherNotesMarkdown(const std::string& notes) {
+    std::string cleaned;
+    cleaned.reserve(notes.size());
+    for (std::size_t index = 0; index < notes.size(); ++index) {
+        const char character = notes[index];
+        if (character != '*') {
+            cleaned.push_back(character);
+            continue;
+        }
+        const bool line_start = index == 0 || notes[index - 1] == '\n' ||
+            (notes[index - 1] == ' ' && index > 1 && notes[index - 2] == '\n');
+        if (line_start) {
+            cleaned.push_back(character);
+            continue;
+        }
+        if (index + 1 < notes.size() && notes[index + 1] == '*') {
+            cleaned.append("**");
+            ++index;
+        }
+    }
+    return cleaned;
+}
+
+const anomaly::NoticeDocument* LauncherReleaseNotes(const std::string& version,
+    const std::string& notes) {
+    static std::string parsed_for;
+    static anomaly::NoticeDocument document;
+    const std::string key = version + ':' + std::to_string(notes.size());
+    if (key != parsed_for) {
+        document = anomaly::ParseNoticeMarkdown(LauncherNotesMarkdown(notes), 0);
+        parsed_for = key;
+    }
+    return &document;
+}
+
+// The prompt an update check ends in: the release's own notes in a pane, and two answers below --
+// skipping that version on the left, updating on the right. Nothing is installed until the right one
+// is pressed, which is the difference between an update and a silent one.
+void DrawUpdatePrompt(
+    LauncherController& controller, const LauncherSnapshot& snapshot,
+    const anomaly::Translator& translator) {
+    const LauncherUpdateStatus& update = snapshot.update;
+    // The dialog's name is its id, and nothing else: its title is drawn below, four pixels lower than
+    // the title bar would have put it, so the line under it keeps the place it has always had. The two
+    // strings still have to be the same one -- OpenPopup and BeginPopupModal pair on this id.
+    const std::string title = Format(translator, anomaly::MessageId::LauncherUpdateAvailable,
+        {update.remote_version});
+    const std::string name = "##update-available";
+    // One question per release, and none for a release the user already skipped: a version answered
+    // once is not asked about again, this session or a later one. The band's chip asks for the same
+    // dialog explicitly, which is why that path opens it even when this session already saw the
+    // automatic one.
+    static std::string prompted_version;
+    const bool asked = std::exchange(g_update_prompt_requested, false);
+    if (update.phase == LauncherUpdatePhase::Available && !update.remote_version.empty() &&
+        (asked || (update.skipped_version != update.remote_version &&
+            prompted_version != update.remote_version))) {
+        prompted_version = update.remote_version;
+        ImGui::OpenPopup(name.c_str());
+    }
+    // The popup's padding: its left edge is the inset the title bar uses (FramePadding.x), so the
+    // first line of content sits exactly under the title instead of a few pixels left of it, and
+    // the bottom of it gives the last row the same room the top gives the first.
+    const ImGuiStyle& dialog_style = ImGui::GetStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+        ImVec2(dialog_style.FramePadding.x, Scale(2.0f)));
+    // Centred on the launcher's canvas -- not on the OS window, which reaches up into the transparent
+    // band above it -- and held there: a question is not a window the user should have to put back.
+    const ImVec2 canvas_min = ImGui::GetWindowPos();
+    const ImVec2 canvas_size = ImGui::GetWindowSize();
+    ImGui::SetNextWindowPos(
+        ImVec2(canvas_min.x + canvas_size.x * 0.5f, canvas_min.y + canvas_size.y * 0.5f),
+        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    // Sized by its contents, like the mod settings dialog, so it grows with the language it is drawn
+    // in rather than clipping a localized label.
+    if (!ImGui::BeginPopupModal(name.c_str(), nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoResize)) {
+        ImGui::PopStyleVar();
+        return;
+    }
+    // The title bar itself draws nothing: its text is put here instead, a few pixels lower than the
+    // bar would have placed it, so the line below keeps the position it has always had. The clip is
+    // widened for it -- a window clips its items to the content area, and the title bar is above that
+    // -- or the text would be drawn and never seen.
+    {
+        const ImVec2 origin = ImGui::GetWindowPos();
+        const ImVec2 corner(origin.x + ImGui::GetWindowSize().x,
+            origin.y + ImGui::GetFontSize() + dialog_style.FramePadding.y * 2.0f);
+        ImDrawList* const draw = ImGui::GetWindowDrawList();
+        draw->PushClipRect(origin, corner, false);
+        draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+            ImVec2(origin.x + dialog_style.FramePadding.x,
+                origin.y + dialog_style.FramePadding.y + Scale(4.0f)),
+            ImGui::GetColorU32(LauncherInk()), title.c_str());
+        draw->PopClipRect();
+    }
+    // The version being left behind, under the title that names the one being installed.
+    ImGui::TextDisabled("%s", Format(translator, anomaly::MessageId::LauncherUpdateCurrent,
+        {ANOMALY_SDK_VERSION_STRING}).c_str());
+    ImGui::Spacing();
+
+    // The notes sit in a pane of their own, on the same material as the page's cards but quieter: it
+    // is a recess inside the dialog, not another object floating over it.
+    const float pane_width = Scale(760.0f);
+    const bool has_notes = !update.notes.empty();
+    if (has_notes) {
+        const float pane_height = Scale(380.0f);
+        const ImVec2 pane_min = ImGui::GetCursorScreenPos();
+        const ImVec2 pane_max(pane_min.x + pane_width, pane_min.y + pane_height);
+        // A plain recess, not a second pane of glass: the material belongs to the surface a window is
+        // cut from, and another layer of it inside the first only muddies both. A tinted fill with a
+        // hairline is what a panel inside a dialog reads as, and it keeps the notes legible.
+        const auto& theme = ue5mem::PlatformUiTheme();
+        ImDrawList* const draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(pane_min, pane_max,
+            ImGui::GetColorU32(ThemeColorWithAlpha(theme.child_background, 0.72f)),
+            Scale(12.0f));
+        draw->AddRect(pane_min, pane_max,
+            ImGui::GetColorU32(ThemeColorWithAlpha(theme.border, 0.55f)),
+            Scale(12.0f), ImDrawFlags_None, Scale(1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        // A child without a border ignores style.WindowPadding unless it is asked to use it, which is
+        // how the notes ended up written against the pane's edges. AlwaysUseWindowPadding gives the
+        // text the inset it needs, and the wrap position follows that inset instead of the window edge.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scale(18.0f, 14.0f));
+        ImGui::BeginChild("##update-notes", ImVec2(pane_width, pane_height),
+            ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_None);
+        // The release publishes markdown; the shell's own parser turns it into blocks, and the blocks
+        // are drawn here in this window's ink rather than dumped as a wall of hashes and asterisks.
+        LauncherDrawReleaseNotes(*LauncherReleaseNotes(update.remote_version, update.notes));
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
+    const bool busy = snapshot.busy || update.Busy();
+    const std::string status = UpdatePhaseText(translator, update);
+    if (update.phase == LauncherUpdatePhase::Downloading) {
+        LauncherDrawDownloadProgress(translator);
+    } else if (!status.empty() && update.phase != LauncherUpdatePhase::Available) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(UpdatePhaseInk(update.phase), "%s", status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    // The two answers are centred as one pair with a gap between them: a dialog asks a question, and
+    // its answers read as the pair that answers it rather than as two corners of the window. The update
+    // is the launcher's primary command -- accent inside the glass, with the download mark -- so the
+    // pair also carries the hierarchy.
+    const float row_height = ButtonHeight(44.0f);
+    const char* const skip_label = Text(translator, anomaly::MessageId::LauncherUpdateSkip);
+    const std::string update_label = Format(translator, anomaly::MessageId::LauncherUpdateInstall,
+        {update.remote_version});
+    // Both widths are measured the way the two controls size themselves -- the chip from its caption,
+    // the command from its mark and label -- so the pair stays centred in every language.
+    const float skip_width = ImGui::CalcTextSize(skip_label).x + Scale(30.0f);
+    const float update_width = ImGui::CalcTextSize(Glyph(0xe8b7)).x +
+        ImGui::CalcTextSize(update_label.c_str()).x + Scale(46.0f);
+    float pair_width = skip_width + update_width + Scale(16.0f);
+    if (!has_notes) {
+        // A release without notes has nothing to read here, so the page that does have something to
+        // read joins the pair instead of leaving an empty pane on screen.
+        pair_width += ImGui::CalcTextSize(
+            Text(translator, anomaly::MessageId::LauncherUpdateOpenPage)).x + Scale(46.0f);
+    }
+    const float pair_left = ImGui::GetCursorPosX() +
+        (std::max)(0.0f, (ImGui::GetContentRegionAvail().x - pair_width) * 0.5f);
+    ImGui::SetCursorPosX(pair_left);
+    ImGui::BeginDisabled(busy);
+    if (LauncherChip(skip_label, ImVec2(skip_width, row_height))) {
+        controller.SkipUpdateVersion(update.remote_version);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    if (!has_notes) {
+        ImGui::SameLine(0.0f, Scale(8.0f));
+        if (LauncherChip(Text(translator, anomaly::MessageId::LauncherUpdateOpenPage),
+                ImVec2(0.0f, row_height))) {
+            LauncherOpenReleasePage(update);
+        }
+    }
+    ImGui::SameLine(0.0f, Scale(16.0f));
+    ImGui::BeginDisabled(busy);
+    if (CommandButton("update-install", 0xe8b7, update_label.c_str(), true, true,
+            ImVec2(update_width / g_launcher_dpi_scale, 44.0f))) {
+        controller.InstallUpdate();
+    }
+    ImGui::EndDisabled();
+    // The package is downloaded from github.com, which a network behind the wrong wall may not reach
+    // at all. These are the same release published where it can be fetched, offered next to the
+    // launcher's own download instead of in place of it. No extra spacing above them: the line after
+    // the answers already carries the row spacing, and a Spacing here doubled it.
+    {
+        const float quark_width = ImGui::CalcTextSize(
+            Text(translator, anomaly::MessageId::LauncherUpdateQuark)).x + Scale(30.0f);
+        const float baidu_width = ImGui::CalcTextSize(
+            Text(translator, anomaly::MessageId::LauncherUpdateBaidu)).x + Scale(30.0f);
+        const float links_width = quark_width + baidu_width + Scale(8.0f);
+        const float links_left = ImGui::GetCursorPosX() +
+            (std::max)(0.0f, (ImGui::GetContentRegionAvail().x - links_width) * 0.5f);
+        ImGui::SetCursorPosX(links_left);
+        if (LauncherChip(Text(translator, anomaly::MessageId::LauncherUpdateQuark),
+                ImVec2(quark_width, row_height))) {
+            const std::wstring url(anomaly::launcher::kReleaseQuarkUrl);
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::SameLine(0.0f, Scale(8.0f));
+        if (LauncherChip(Text(translator, anomaly::MessageId::LauncherUpdateBaidu),
+                ImVec2(baidu_width, row_height))) {
+            const std::wstring url(anomaly::launcher::kReleaseBaiduUrl);
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+    // The padding no longer gives the bottom the room the top does not need, so the last row keeps a
+    // reserve of its own instead of sitting on the window's edge.
+    ImGui::Dummy(ImVec2(0.0f, Scale(10.0f)));
+    ImGui::EndPopup();
+    ImGui::PopStyleVar();
+}
+
+// The support buttons: the platforms' own artwork, side by side under one heading. Both open in the
+// browser; neither is a payment flow this window implements.
+void DrawSupportSettings(const anomaly::Translator& translator) {
+    if (g_graphics == nullptr) return;
+    const Graphics& graphics = *g_graphics;
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSectionSupport));
+    const ImVec2 afdian = SupportButtonSize(graphics.sponsor,
+        graphics.sponsor_width, graphics.sponsor_height);
+    const ImVec2 kofi = SupportButtonSize(graphics.kofi,
+        graphics.kofi_width, graphics.kofi_height);
+    // The pair sits on one line at the section's own left edge, so it starts where the heading and
+    // every row above it start. Each picture is still centred vertically against the taller of the
+    // two, because the cards are not the same height and a shared baseline would stagger them.
+    const float row_height = (std::max)(afdian.y, kofi.y);
+    const float row_top = ImGui::GetCursorPosY();
+    ImGui::SetCursorPosY(row_top + (row_height - afdian.y) * 0.5f);
+    SupportButton(graphics.sponsor, graphics.sponsor_width, graphics.sponsor_height,
+        "##support-afdian", Text(translator, anomaly::MessageId::LauncherSupportAfdian),
+        kSponsorUrl);
+    ImGui::SameLine(0.0f, Scale(12.0f));
+    ImGui::SetCursorPosY(row_top + (row_height - kofi.y) * 0.5f);
+    SupportButton(graphics.kofi, graphics.kofi_width, graphics.kofi_height, "##support-kofi",
+        Text(translator, anomaly::MessageId::LauncherSupportKofi), kKofiUrl);
+}
+
+// The about section closes the page: the project's own two addresses -- where its source lives, and
+// where the people using it gather -- side by side under one heading. Neither is a page this window
+// draws; both are handed to the shell, the way every other link here leaves the machine.
+void DrawAboutSettings(const anomaly::Translator& translator) {
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSectionAbout));
+    struct Address final {
+        anomaly::MessageId label;
+        const char* id;         // names the chip; the drawn caption is the label
+        std::string_view url;   // data, not copy -- a translated address leads nowhere
+    };
+    constexpr std::array<Address, 2> addresses{{
+        {anomaly::MessageId::LauncherAboutGithub, "##about-github", kRepositoryUrl},
+        {anomaly::MessageId::LauncherAboutDiscord, "##about-discord", kDiscordUrl},
+    }};
+    const float row_height = ButtonHeight(40.0f);
+    for (std::size_t index = 0; index < addresses.size(); ++index) {
+        const Address& address = addresses[index];
+        const char* const label = Text(translator, address.label);
+        // The capsule is measured from its own caption rather than from a constant: the two names are
+        // the platforms' and are spelled the same way in both locales, but the padding around them
+        // belongs to this window and follows its scale.
+        const float width = ImGui::CalcTextSize(label).x + Scale(40.0f);
+        if (index > 0) ImGui::SameLine(0.0f, Scale(12.0f));
+        const std::string chip = std::string(label) + address.id;
+        if (LauncherChip(chip.c_str(), ImVec2(width, row_height))) {
+            const std::wstring url = Utf8Wide(address.url);
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        // The address itself, for the user who would rather copy it than follow it.
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%.*s", static_cast<int>(address.url.size()), address.url.data());
+        }
+    }
 }
 
 void DrawSettingsMode(
@@ -6778,6 +8125,9 @@ void DrawSettingsMode(
     }
 
     DrawStartupSettings(controller, snapshot, translator);
+    DrawUpdateSettings(controller, snapshot, translator);
+    DrawSupportSettings(translator);
+    DrawAboutSettings(translator);
 
     // The page reports the outcome of its own writes. Everything it can change is saved
     // with the shared scope, so a failure is the only thing that has to be said out
@@ -6800,8 +8150,7 @@ void DrawSettingsMode(
 // the window title, then the minimise and close controls the frame used to own.
 // Nothing here paints a background, so the wallpaper and the stickers show
 // through the caption exactly as they do behind the rest of the window.
-void DrawLauncherTitleBar(
-    Graphics& graphics, const anomaly::Translator& translator) {
+void DrawLauncherTitleBar(Graphics& graphics) {
     const auto& theme = ue5mem::PlatformUiTheme();
     const float height = Scale(64.0f);
     // The marks are narrower than the caption is tall. At the full height the two of
@@ -6954,7 +8303,20 @@ void DrawLauncher(
     // A preference the user changed is written once the worker is free, so the settings page
     // needs no save button and a slider drag costs one write.
     controller.FlushSettings();
+    // The update check this launch owes, if it owes one: it runs on the worker and reports into
+    // the settings page, so nothing pops up over the page the user is reading.
+    controller.AutoCheckUpdates();
     const LauncherSnapshot snapshot = controller.Snapshot();
+    // The update has replaced the image this window was drawn by and started the new one. This
+    // window closes rather than outliving the file it was loaded from, and so that the two
+    // launchers never write the same configuration at the same time.
+    if (snapshot.restart_pending) {
+        static bool close_posted{};
+        if (!close_posted) {
+            close_posted = true;
+            PostMessageW(window, WM_CLOSE, 0, 0);
+        }
+    }
     // The language is applied here rather than at start-up only: switching it on the settings page
     // repaints this frame, and the window title follows. The reference below is taken after the
     // swap, so every page draws with the catalog that is in hand.
@@ -6987,7 +8349,7 @@ void DrawLauncher(
     const ImVec2 root_size = ImGui::GetWindowSize();
     DrawLauncherThemeImages(graphics, snapshot.theme, root_origin, root_size, false);
     anomaly::glass::CaptureBackdrop(ImGui::GetWindowDrawList());
-    DrawLauncherTitleBar(graphics, translator);
+    DrawLauncherTitleBar(graphics);
     DrawModes(controller, snapshot, mode, translator);
     // The body is one frosted card inset from the canvas edge, so the wallpaper
     // and the stickers stay visible around it and refract through it.
@@ -7021,6 +8383,11 @@ void DrawLauncher(
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
     DrawLauncherThemeImages(graphics, snapshot.theme, root_origin, root_size, true);
+    // The update prompt is drawn last, on the root window: an update check runs in the background, so
+    // the question it ends in has to reach the user on whatever page they are reading -- and drawing it
+    // after the page keeps the dialog the last window created in the frame, which is what puts it in
+    // front of the page's own child windows instead of behind them.
+    DrawUpdatePrompt(controller, snapshot, translator);
     ImGui::End();
     ImGui::PopStyleVar();
 }
@@ -7031,6 +8398,31 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     static_cast<void>(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2));
     const auto administrator = EnsureAdministrator(command_line);
     if (!administrator.run_current_process) return administrator.exit_code;
+
+    int argument_count{};
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+    DWORD parent_process{};
+    if (arguments != nullptr) {
+        if (argument_count == 3 && std::wstring_view(arguments[1]) == L"--wait-for-update") {
+            wchar_t* end{};
+            parent_process = wcstoul(arguments[2], &end, 10);
+            if (end == arguments[2] || *end != L'\0' || parent_process == GetCurrentProcessId()) {
+                LocalFree(arguments);
+                return ERROR_INVALID_PARAMETER;
+            }
+        }
+        LocalFree(arguments);
+    }
+    if (parent_process != 0) {
+        const HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_process);
+        if (parent != nullptr) {
+            const DWORD waited = WaitForSingleObject(parent, 60000);
+            CloseHandle(parent);
+            if (waited != WAIT_OBJECT_0) return ERROR_TIMEOUT;
+        } else if (GetLastError() != ERROR_INVALID_PARAMETER) {
+            return static_cast<int>(GetLastError());
+        }
+    }
 
     // The release directory also contains the proxy payload named dwmapi.dll.
     // Pin the system module before ImGui's delay imports are resolved.
@@ -7143,6 +8535,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     graphics.logo = LoadEmbeddedTexture(graphics, kLogoResourceId);
     graphics.mod_placeholder = LoadEmbeddedTexture(graphics, kModPlaceholderResourceId,
         &graphics.mod_placeholder_width, &graphics.mod_placeholder_height);
+    graphics.sponsor = LoadEmbeddedTexture(graphics, kSponsorResourceId,
+        &graphics.sponsor_width, &graphics.sponsor_height);
+    graphics.kofi = LoadEmbeddedTexture(graphics, kKofiResourceId,
+        &graphics.kofi_width, &graphics.kofi_height);
     LauncherController controller(ExecutableDirectory());
     LauncherMode mode = LauncherMode::Launch;
 

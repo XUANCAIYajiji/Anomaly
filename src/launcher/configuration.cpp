@@ -14,6 +14,15 @@
 #include <utility>
 
 namespace anomaly::launcher {
+
+bool IsCustomLauncherBackground(PlatformUiPalette palette,
+    std::string_view background_path, bool enabled) {
+    if (!enabled || background_path.empty()) return false;
+    auto normalized = std::filesystem::path(std::u8string(background_path.begin(), background_path.end()))
+        .lexically_normal().generic_u8string();
+    for (auto& c : normalized) if (c >= u8'A' && c <= u8'Z') c = static_cast<char8_t>(c - u8'A' + u8'a');
+    return palette != PlatformUiPalette::Naiwa || normalized != u8"assets/images/naiwa-background.png";
+}
 namespace {
 
 constexpr std::uint64_t kMaximumConfigurationBytes = 64U * 1024U;
@@ -477,6 +486,15 @@ LauncherConfigurationLoadResult LoadLauncherConfiguration(
                 target.surface_opacity = std::clamp(
                     artwork.value("surfaceOpacity", target.surface_opacity), -1.0f, 1.0f);
             }
+            if (document.contains("update") && document.at("update").is_object()) {
+                const auto& update = document.at("update");
+                result.configuration.update.auto_check =
+                    update.value("autoCheck", result.configuration.update.auto_check);
+                result.configuration.update.endpoint =
+                    update.value("endpoint", std::string{});
+                result.configuration.update.skipped_version =
+                    update.value("skippedVersion", std::string{});
+            }
             if (document.contains("customColors") && document.at("customColors").is_object()) {
                 const auto& colors = document.at("customColors");
                 anomaly::PlatformUiCustomColors& target = result.configuration.custom_colors;
@@ -558,6 +576,11 @@ LauncherConfigurationSaveResult SaveLauncherConfiguration(
             {"clients", {
                 {"mainlandChina", client_document(configuration.mainland_china)},
                 {"global", client_document(configuration.global)},
+            }},
+            {"update", {
+                {"autoCheck", configuration.update.auto_check},
+                {"endpoint", configuration.update.endpoint},
+                {"skippedVersion", configuration.update.skipped_version},
             }},
         };
         const std::string text = document.dump(2) + '\n';

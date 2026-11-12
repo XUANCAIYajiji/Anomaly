@@ -240,8 +240,40 @@ std::string VehicleToken(std::string_view path) {
     if (end == at + 8 || end > at + 14 || (end < path.size() && path[end] != '/' && path[end] != '_' && path[end] != '.')) return {};
     return "Vehicle_" + std::string(path.substr(at + 8, end - at - 8));
 }
+bool RestrictedVehicle(std::string_view normalized) {
+    constexpr std::string_view token = "vehicle_045";
+    const auto alphanumeric = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    };
+    for (auto at = normalized.find(token); at != std::string_view::npos;
+         at = normalized.find(token, at + token.size())) {
+        const auto end = at + token.size();
+        if ((at == 0 || !alphanumeric(normalized[at - 1])) &&
+            (end == normalized.size() || !alphanumeric(normalized[end]))) return true;
+    }
+    return false;
+}
+bool RestrictedModMetadata(const std::filesystem::path& file) {
+    std::ifstream input(file, std::ios::binary);
+    if (!input) return false;
+    const auto document = nlohmann::json::parse(input, nullptr, false);
+    if (!document.is_object()) return false;
+    for (const auto* key : {"name", "displayName", "fileName"}) {
+        const auto value = document.find(key);
+        if (value != document.end() && value->is_string() &&
+            PakModNameRestricted(value->get_ref<const std::string&>())) return true;
+    }
+    return false;
+}
+std::string LooseModNotesKey(std::string_view name) {
+    constexpr std::string_view suffix = ".mod-notes.json";
+    const auto lower = NormalizePakModKey(std::string(name));
+    if (lower.find('/') != std::string::npos || !lower.ends_with(suffix)) return {};
+    return lower.substr(0, lower.size() - suffix.size()) + ".pak";
+}
 void AddAsset(PakModCatalogEntry& row, IndexedAsset asset) {
     auto path = NormalizePakModKey(std::move(asset.path));
+    row.restricted = row.restricted || RestrictedVehicle(path);
     const auto content = path.find("/ht/content/");
     if (content != std::string::npos) path = "/game/" + path.substr(content + 12);
     else {
@@ -353,6 +385,39 @@ PakModGroupName ParsePakModGroup(const std::string_view token) {
     return {token.substr(0, separator), token.substr(separator + 1)};
 }
 
+bool PakModNameRestricted(const std::string_view name) {
+    const auto lower = NormalizePakModKey(std::string(name));
+    return lower.find("tank") != std::string::npos || lower.find("panzer") != std::string::npos ||
+        RestrictedVehicle(lower);
+}
+
+bool PakModFileRestricted(const std::filesystem::path& file) {
+    const auto absolute = std::filesystem::absolute(file).lexically_normal();
+    const auto parent = absolute.parent_path();
+    if (PakModNameRestricted(PathText(parent.filename())) ||
+        PakModNameRestricted(PathText(file.filename()))) return true;
+    for (const auto* name : {L"mod.json", L"anomaly-source.json", L"mod-notes.json"})
+        if (RestrictedModMetadata(parent / name)) return true;
+    for (const auto& row : ReadPakModCatalog(parent, nlohmann::json::object()))
+        for (const auto& container : row.containers)
+            if (CompareStringOrdinal(container.c_str(), -1, absolute.c_str(), -1, TRUE) == CSTR_EQUAL)
+                return row.restricted;
+    throw std::runtime_error("container is absent from the mod catalog");
+}
+
+void DisableRestrictedPakMods(const std::filesystem::path& directory) {
+    for (const auto& row : ReadPakModCatalog(directory, nlohmann::json::object())) {
+        if (!row.restricted) continue;
+        for (const auto& file : row.containers) {
+            if (NormalizePakModKey(PathText(file.extension())) == ".disabled") continue;
+            const auto target = std::filesystem::path(file.wstring() + L".disabled");
+            // MoveFileEx without REPLACE_EXISTING preserves an existing disabled container.
+            if (!MoveFileExW(file.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH))
+                throw std::runtime_error("cannot disable restricted mod container: " + PathText(file));
+        }
+    }
+}
+
 std::vector<std::string> ReadModContainerIndex(const std::filesystem::path& file) {
     std::vector<std::string> paths;
     for (auto& asset : ReadIndex(file).assets) paths.push_back(std::move(asset.path));
@@ -363,6 +428,11 @@ std::shared_ptr<const std::vector<PakModCatalogEntry>> PakModCatalogCache::Read(
     const auto root = std::filesystem::absolute(directory).lexically_normal();
     const auto states = settings.value("modStates", nlohmann::json::object());
     ValidatePakModStates(states);
+    dirty_ = changes_.Changed(root) || dirty_;
+    if (snapshot_ && directory_ == root && !dirty_ && states_ == states) return snapshot_;
+    // Keep invalidation pending if metadata or index inspection throws.
+    dirty_ = true;
+    ++metadata_scans_;
     decltype(files_) files;
     if (std::filesystem::exists(root)) {
         if (GetFileAttributesW(root.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT)
@@ -382,16 +452,21 @@ std::shared_ptr<const std::vector<PakModCatalogEntry>> PakModCatalogCache::Read(
             // indexes: a cover or a `.ucas` marker decides which folder is a mod, so adding one can
             // change a key without changing any container.
             if (extension == ".pak" || extension == ".utoc" || extension == ".ucas" ||
-                extension == ".sig" || PakModShippedFile(PathText(logical)))
+                extension == ".sig" || PakModShippedFile(PathText(logical)) ||
+                !LooseModNotesKey(PathText(logical.lexically_relative(root))).empty())
                 files.emplace(it->path(), std::pair{it->last_write_time(), it->file_size()});
         }
     }
-    if (snapshot_ && directory_ == root && files_ == files && states_ == states) return snapshot_;
+    if (snapshot_ && directory_ == root && files_ == files && states_ == states) {
+        dirty_ = false;
+        return snapshot_;
+    }
     auto snapshot = std::make_shared<const std::vector<PakModCatalogEntry>>(ReadPakModCatalog(root, settings));
     directory_ = root;
     files_ = std::move(files);
     states_ = states;
     snapshot_ = std::move(snapshot);
+    dirty_ = false;
     return snapshot_;
 }
 std::vector<PakModCatalogEntry> ReadPakModCatalog(const std::filesystem::path& directory, const nlohmann::json& settings) {
@@ -406,8 +481,10 @@ std::vector<PakModCatalogEntry> ReadPakModCatalog(const std::filesystem::path& d
         std::string logical, extension;
         std::filesystem::path file;
         bool disabled{};
+        std::string key;
     };
     std::vector<Container> containers;
+    std::vector<std::pair<std::string, std::filesystem::path>> metadata;
     PakModLayout layout;
     std::size_t scanned{};
     for (auto it = std::filesystem::recursive_directory_iterator(directory); it != std::filesystem::recursive_directory_iterator{}; ++it) {
@@ -434,17 +511,19 @@ std::vector<PakModCatalogEntry> ReadPakModCatalog(const std::filesystem::path& d
         // the files a mod is distributed with: they are what marks a folder as a mod.
         if (extension == ".ucas" || extension == ".sig" || PakModShippedFile(logical))
             layout.AddOwnerFile(logical);
+        if (extension == ".json" && (PakModShippedFile(logical) || !LooseModNotesKey(logical).empty()))
+            metadata.emplace_back(std::move(logical), it->path());
     }
-    for (const auto& container : containers) {
+    for (auto& container : containers) {
         const auto root = layout.Root(container.logical);
         const auto stem = container.logical.substr(0, container.logical.size() - container.extension.size());
-        const auto key = root.empty() ? stem + ".pak" : root + "/";
+        const auto key = NormalizePakModKey(root.empty() ? stem + ".pak" : root + "/");
+        container.key = key;
         auto& row = found[key]; row.key = key;
         row.name = PakModFolderName(root.empty() ? std::string_view(stem) : std::string_view(root));
         row.disabled_files = row.disabled_files || container.disabled;
-        auto selection_path = container.logical;
-        if (container.extension == ".utoc") selection_path.replace(selection_path.size() - 5, 5, ".pak");
-        if (!container.disabled && PakModEnabled(states, selection_path)) row.enabled = true;
+        row.restricted = row.restricted || PakModNameRestricted(container.logical);
+        row.containers.push_back(container.file);
         try {
             auto index = ReadIndex(container.file);
             for (auto& asset : index.assets) AddAsset(row, std::move(asset));
@@ -453,9 +532,37 @@ std::vector<PakModCatalogEntry> ReadPakModCatalog(const std::filesystem::path& d
         }
         catch (const std::exception& e) { row.index_complete = false; row.analysis_error = e.what(); }
     }
+    for (const auto& [logical, file] : metadata) {
+        const auto root = layout.Root(logical);
+        const auto key = root.empty() ? LooseModNotesKey(logical) : NormalizePakModKey(root + "/");
+        const auto row = found.find(key);
+        if (row != found.end() && !row->second.restricted)
+            row->second.restricted = RestrictedModMetadata(file);
+    }
+    // A selection is stored under the mod's path, so a folder moved by hand leaves it behind: a mod
+    // that no saved entry reaches any more would read as enabled again, and the variants the player
+    // switched off to break a resource conflict would come back with it. The mod name survives the
+    // move, so it is what the leftover entry is matched on -- but only while it names one mod.
+    std::map<std::string, std::size_t> names;
+    for (const auto& entry : found) ++names[PakModSelectionName(entry.first)];
+    // Resolve each container with the same precedence as the runtime. A current per-file key
+    // for one container must not suppress inherited selections for its siblings.
+    for (const auto& container : containers) {
+        if (container.disabled) continue;
+        auto selection_path = container.logical;
+        if (container.extension == ".utoc") selection_path.replace(selection_path.size() - 5, 5, ".pak");
+        bool enabled;
+        if (PakModSelectionApplied(states, selection_path)) enabled = PakModEnabled(states, selection_path);
+        else {
+            const auto name = PakModSelectionName(container.key);
+            enabled = PakModInheritedSelection(states, name, names[name] == 1).value_or(true);
+        }
+        found.at(container.key).enabled |= enabled;
+    }
     std::vector<PakModCatalogEntry> result;
     for (auto& [key, row] : found) {
         ClassifyResources(row);
+        if (row.restricted) row.enabled = false;
         result.push_back(std::move(row));
     }
     return result;
@@ -466,12 +573,51 @@ bool PakModsConflict(const PakModCatalogEntry& a, const PakModCatalogEntry& b) {
             ConflictingContents(a.chunk_fingerprints, b.chunk_fingerprints) ||
             Intersects(a.model_vehicles, b.model_vehicles));
 }
+namespace {
+// A selection is stored under the mod's path, so a folder moved by hand leaves the key behind. That
+// key reaches no mod any more, and keeping it would re-apply an old choice if the folder ever moved
+// back; the write below stores the choice under the path the mod lives on now. Only a name that still
+// identifies exactly one mod says which leftover entry belonged to it.
+void DropMovedPakModSelections(nlohmann::json& states, const std::vector<PakModCatalogEntry>& catalog,
+    const std::string& mod_key) {
+    if (!states.is_object()) return;
+    const auto name = PakModSelectionName(mod_key);
+    if (name.empty()) return;
+    if (std::count_if(catalog.begin(), catalog.end(), [&](const PakModCatalogEntry& row) {
+            return PakModSelectionName(row.key) == name;
+        }) != 1) return;
+    const auto reaches_a_mod = [&](const std::string& candidate) {
+        return std::any_of(catalog.begin(), catalog.end(), [&](const PakModCatalogEntry& row) {
+            const auto mod = NormalizePakModKey(row.key);
+            return mod == candidate || (candidate.back() == '/' && mod.starts_with(candidate)) ||
+                candidate.starts_with(mod);
+        });
+    };
+    for (auto it = states.begin(); it != states.end();) {
+        const auto candidate = NormalizePakModKey(it.key());
+        if (!candidate.empty() && PakModSelectionName(it.key()) == name && !reaches_a_mod(candidate)) {
+            it = states.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+} // namespace
+
 void SelectPakMod(nlohmann::json& settings, const std::vector<PakModCatalogEntry>& catalog,
     std::string_view key, bool enabled) {
     const auto normalized = NormalizePakModKey(std::string(key));
     const auto selected = std::find_if(catalog.begin(), catalog.end(), [&](const auto& row) { return NormalizePakModKey(row.key) == normalized; });
     if (selected == catalog.end()) throw std::runtime_error("mod no longer exists");
-    if (enabled) for (const auto& row : catalog) if (PakModsConflict(*selected, row)) SetPakModEnabled(settings["modStates"], row.key, false);
+    if (enabled && selected->restricted) throw std::runtime_error("mod is restricted");
+    // A forced selection keeps every conflicting mod: a patch that ships the same body as the mod it
+    // patches has to load beside it, and the engine's effective read priority selects shared paths.
+    if (enabled && !PakModForceLoad(settings))
+        for (const auto& row : catalog) if (PakModsConflict(*selected, row)) {
+            DropMovedPakModSelections(settings["modStates"], catalog, row.key);
+            SetPakModEnabled(settings["modStates"], row.key, false);
+        }
+    DropMovedPakModSelections(settings["modStates"], catalog, selected->key);
     SetPakModEnabled(settings["modStates"], selected->key, enabled);
 }
 void UpdatePakModSettings(const std::vector<std::filesystem::path>& paths,
@@ -490,6 +636,7 @@ void UpdatePakModSettings(const std::vector<std::filesystem::path>& paths,
         auto settings = ReadPakModSettings(path.parent_path().parent_path());
         update(settings); settings["schemaVersion"] = 1;
         static_cast<void>(PakModCompatibilityMode(settings)); static_cast<void>(settings.value("enabled", true));
+        static_cast<void>(PakModForceLoad(settings));
         ValidatePakModStates(settings.value("modStates", nlohmann::json::object()));
         writes.emplace_back(path, settings.dump(2) + '\n');
     }
