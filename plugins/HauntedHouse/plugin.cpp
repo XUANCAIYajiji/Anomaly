@@ -42,7 +42,7 @@ constexpr std::uint64_t kAutoTeleportSettleMilliseconds = 250;
 constexpr std::uint64_t kAutoClickWindowMilliseconds = 2500;
 constexpr std::string_view kInteractButtonName = "InteractButton";
 // 「交互-查看」之后要关掉的查看窗口，等效于按 ESC：它是 WB_CommonDeactivate 上的
-// ButtonDeactivate，点它比等你按 ESC 更省事。
+// ButtonDeactivate，直接点它比合成按键更省事。
 constexpr std::string_view kDeactivateButtonName = "ButtonDeactivate";
 // 关窗按钮所属的 widget：名字对不上时，退一步在这个 widget 里找一个可点的按钮。
 constexpr std::string_view kDeactivateWindowName = "WB_CommonDeactivate";
@@ -106,7 +106,7 @@ constexpr std::array<ItemKind, 4> kItemKinds{{
 
 // 一键完成主线：主线每一步到位后要做什么，顺序与 kPoints 里的主线点严格一一对应。
 // interact：到位后点一次 F 交互按钮；deactivate：交互后点 ButtonDeactivate 关掉查看窗口
-// （等效 ECS，点不到时退回等你手动按 ESC）；interact_delay_ms：交互前额外等多久。
+// （等效 ESC，窗口没开或按钮点不到时记录后继续）；interact_delay_ms：交互前额外等多久。
 struct StepAuto final {
     bool interact{};
     bool deactivate{};
@@ -241,7 +241,7 @@ struct Context final {
     AnomalyGenerationHandleV1 auto_click_request{};
     std::uint64_t auto_deadline{};
 
-    // 一键完成主线：按主线顺序跑一遍，逐点传送 + 交互（个别点等你按 ESC）。
+    // 一键完成主线：按主线顺序跑一遍，逐点传送 + 交互（第 3 步交互后关掉查看窗口）。
     std::atomic_bool main_run_requested{};
     std::atomic_bool main_stop_requested{};
     std::atomic_bool main_active{};
@@ -1165,8 +1165,9 @@ void StepAutoPick(Context &context) {
 }
 
 // ---- 一键完成主线 ----------------------------------------------------------------
-// 按主线顺序逐点：传送 → 等落地 →（可选）等一会儿 → 点一次交互 →（可选）等你按 ESC
-// → 下一个点。主线坐标来自 kPoints（可被配置覆盖），行为来自 kMainAutoSteps。
+// 按主线顺序逐点：传送 → 等落地 →（可选）等一会儿 → 点一次交互 →（第 3 步额外）
+// 点 ButtonDeactivate 关掉查看窗口 → 下一个点。主线坐标来自 kPoints（可被配置覆盖），
+// 行为来自 kMainAutoSteps。
 
 
 // 第 ordinal 个主线点（0 起，按 kPoints 顺序）。表里现在只有主线点，所以就是下标本身。
@@ -1904,7 +1905,7 @@ AnomalyPluginEntryV1(AnomalyPluginDescriptorV1 *descriptor) {
                    ANOMALY_PLUGIN_API_V1_MINOR,
                    anomaly::sdk::StringView("xuancaiyajiji.haunted-house"),
                    anomaly::sdk::StringView("Haunted House"),
-                   anomaly::sdk::StringView("Anomaly"),
+                   anomaly::sdk::StringView("XUANCAIYajiji"),
                    anomaly::sdk::StringView("1.0.0"),
                    Load,
                    Start,
